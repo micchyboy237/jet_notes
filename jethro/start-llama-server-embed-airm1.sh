@@ -1,0 +1,14 @@
+llama-server \
+  -m /Users/jethroestrada/.cache/llama.cpp/embed_models/nomic-embed-text-v2-moe.Q4_K_M.gguf \
+  --embeddings \
+  --pooling cls \
+  -c 512 \
+  -ngl all \
+  -np 4 \
+  -ub 1024 \
+  -b 2048 \
+  --threads 8 \
+  --no-mmap \
+  --mlock \
+  --host 0.0.0.0 \
+  --port 8081
