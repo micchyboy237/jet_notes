@@ -3,12 +3,15 @@ llama-server \
   --ctx-size 8192 \
   --n-gpu-layers -1 \
   --flash-attn on \
-  --threads -1 \
-  --threads-batch -1 \
+  --threads 4 \
+  --threads-batch 4 \
   --batch-size 1024 \
   --ubatch-size 512 \
   --mlock \
   --host 0.0.0.0 \
   --port 8080 \
   --no-mmap \
-  --cont-batching
+  --cont-batching \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --jinja
