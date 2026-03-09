@@ -1,0 +1,14 @@
+llama-server \
+  --model /Users/jethroestrada/.cache/llama.cpp/llm_models/mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
+  --ctx-size 8192 \
+  --n-gpu-layers 99 \
+  --flash-attn on \
+  --threads -1 \
+  --threads-batch -1 \
+  --batch-size 1024 \
+  --ubatch-size 512 \
+  --mlock \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --no-mmap \
+  --cont-batching
