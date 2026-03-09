@@ -1,5 +1,6 @@
 llama-server \
   --model /Users/jethroestrada/.cache/llama.cpp/llm_models/mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
+  --mmproj /Users/jethroestrada/.cache/llama.cpp/llm_models/mmproj-mistralai_Ministral-3-3B-Instruct-2512-f16.gguf \
   --ctx-size 8192 \
   --n-gpu-layers -1 \
   --flash-attn on \
