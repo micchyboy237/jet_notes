@@ -4,9 +4,8 @@ llama-server \
   --pooling cls \
   --host 0.0.0.0 \
   --port 8081 -c 8192 -ub 8192 -b 8192 \
-  --n-gpu-layers -1 \
-  --threads 10 \
-  --threads-batch 10 \
+  --n-gpu-layers all \
+  --threads 8 \
   --mlock \
   --no-mmap \
   --flash-attn on \
