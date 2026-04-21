@@ -1,3 +1,4 @@
+# https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512
 llama-server \
   --model /Users/jethroestrada/.cache/llama.cpp/llm_models/mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
   --mmproj /Users/jethroestrada/.cache/llama.cpp/llm_models/mmproj-mistralai_Ministral-3-3B-Instruct-2512-f16.gguf \
@@ -16,3 +17,21 @@ llama-server \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   --jinja
+
+
+# https://huggingface.co/dphn/dolphin-2_6-phi-2
+llama-server \
+  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/nsfw/dolphin-2_6-phi-2.Q4_K_M.gguf" \
+  -ngl all \
+  -c 4096 \
+  -b 512 \
+  -ub 512 \
+  --threads 4 \
+  --threads-batch 4 \
+  --cont-batching \
+  --cache-prompt \
+  -fa auto \
+  --mlock \
+  --jinja \
+  --host 0.0.0.0 \
+  --port 8080
