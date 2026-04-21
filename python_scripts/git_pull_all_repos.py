@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -240,6 +241,7 @@ def git_pull_all_repos(
 
 def main():
     OUTPUT_DIR = Path(__file__).parent / "generated" / Path(__file__).stem
+    shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
 
     parser = argparse.ArgumentParser(
         description="Recursively pull all Git repositories under a directory."
