@@ -2,12 +2,94 @@ import argparse
 import fnmatch
 import os
 import shutil
+import time
 from typing import Generator, List, Optional
 
 from jet.file import traverse_directory
 from jet.file.utils import save_file
 from jet.logger import logger
 from tqdm import tqdm
+
+
+def get_relative_time_string(timestamp: float) -> str:
+    """
+    Convert a unix timestamp to a relative time string like '1h 12m ago'.
+    Format matches: 3m ago, 1h 12m ago, 1d 23h 1m ago, 1y 360d 2h 59m ago
+    """
+    now = time.time()
+    diff = now - timestamp
+
+    if diff < 0:
+        diff = 0
+
+    minutes = int(diff // 60)
+    hours = int(minutes // 60)
+    days = int(hours // 24)
+    years = int(days // 365)
+
+    # Remainders
+    remaining_days = days % 365
+    remaining_hours = hours % 24
+    remaining_minutes = minutes % 60
+
+    parts = []
+
+    if years > 0:
+        parts.append(f"{years}y")
+    if remaining_days > 0:
+        parts.append(f"{remaining_days}d")
+    if remaining_hours > 0:
+        parts.append(f"{remaining_hours}h")
+    if remaining_minutes > 0:
+        parts.append(f"{remaining_minutes}m")
+
+    # If less than a minute, show seconds or 'Just now'
+    if not parts:
+        seconds = int(diff)
+        if seconds < 10:
+            return "Just now"
+        else:
+            return f"{seconds}s ago"
+
+    return " ".join(parts) + " ago"
+
+
+def get_latest_mtime(folder_path: str) -> float:
+    """
+    Walk through the folder and find the latest modification time of any file or directory.
+    Returns the max mtime found, or the folder's own mtime if empty/error.
+    """
+    max_mtime = 0.0
+    try:
+        # Check the folder itself first
+        max_mtime = os.path.getmtime(folder_path)
+
+        for root, dirs, files in os.walk(folder_path):
+            # Check directories
+            for d in dirs:
+                try:
+                    dir_path = os.path.join(root, d)
+                    mtime = os.path.getmtime(dir_path)
+                    if mtime > max_mtime:
+                        max_mtime = mtime
+                except (OSError, FileNotFoundError):
+                    continue
+
+            # Check files
+            for f in files:
+                try:
+                    file_path = os.path.join(root, f)
+                    mtime = os.path.getmtime(file_path)
+                    if mtime > max_mtime:
+                        max_mtime = mtime
+                except (OSError, FileNotFoundError):
+                    continue
+    except (OSError, FileNotFoundError):
+        # If we can't access the folder, return 0 or current time?
+        # Returning 0 will make it look very old ("Years ago"), which is safe.
+        return 0.0
+
+    return max_mtime
 
 
 def match_patterns(file_path: str, patterns: List[str]) -> bool:
@@ -34,7 +116,7 @@ def get_folder_sizes(folder_path: str) -> float:
                 total_size += get_size(file_path)
             except FileNotFoundError:
                 continue
-    return total_size / (1024 * 1024)  # Use 1024-based MB for consistency
+    return total_size / (1024 * 1024)
 
 
 def find_large_folders(
@@ -49,13 +131,10 @@ def find_large_folders(
     **kwargs,
 ) -> Generator[dict, None, List[dict]]:
     """Find folders larger than min_size_mb and optionally delete them.
-
     Yields individual folder data and finally returns the complete sorted list.
     """
     results: List[dict] = []
     base_dir = os.path.expanduser(base_dir)
-
-    # DEBUG: Log filter parameters at startup
     logger.debug(
         f"[FILTER SETUP] min_depth={min_depth}, max_depth={depth}, base_dir={base_dir}"
     )
@@ -63,57 +142,51 @@ def find_large_folders(
         logger.info(
             f"🎯 Depth filter active: only including folders with depth >= {min_depth}"
         )
-
     output_file: str = kwargs.pop(
         "output_file", os.path.join(base_dir, "_large_folders.json")
     )
     save_results: bool = kwargs.pop("save", False)
-
     total_folders = 0
     pbar = tqdm(desc="Scanning folders", unit=" folder")
-
-    # Configure traversal depth/direction
     direction: str = kwargs.get("direction", "forward")
     kwargs["max_forward_depth"] = depth if direction in ("forward", "both") else None
     kwargs["max_backward_depth"] = (
         kwargs.get("max_backward_depth") if direction in ("backward", "both") else None
     )
-
     for folder, current_depth in traverse_directory(
         base_dir, includes, excludes, exclude_nested=exclude_nested, **kwargs
     ):
-        # DEBUG: Log every folder encountered
         logger.debug(f"[TRAVERSAL] Found: {folder} | depth={current_depth}")
-
-        # ⭐ CRITICAL FILTER: Skip folders shallower than min_depth
         if min_depth is not None and current_depth < min_depth:
-            # DEBUG: Explicit log when skipping
             logger.debug(
                 f"⏭️  SKIP (depth {current_depth} < min_depth {min_depth}): {folder}"
             )
             continue
-
-        # DEBUG: Confirm folder passed depth filter
         logger.debug(f"✅ PASS depth filter: {folder} (depth={current_depth})")
-
         folder_size_mb = get_folder_sizes(folder)
         logger.debug(f"📊 Calculated size: {folder_size_mb:.2f} MB for {folder}")
-
         if folder_size_mb >= min_size_mb:
             total_folders += 1
             pbar.set_postfix({"Depth": current_depth, "Large folders": total_folders})
             pbar.update(1)
+
+            # Calculate the latest modification time for this folder
+            latest_mtime = get_latest_mtime(folder)
+            readable_time = get_relative_time_string(latest_mtime)
+
             logger.success(
-                f"\n📁 LARGE FOLDER | Size: {format_size(folder_size_mb)} | Depth: {current_depth} | {folder}"
+                f"\n📁 LARGE FOLDER | Size: {format_size(folder_size_mb)} | Depth: {current_depth} | Last Mod: {readable_time} | {folder}"
             )
+
             folder_data = {
                 "size": folder_size_mb,
                 "file": folder,
                 "depth": current_depth,
+                "updated_at_timestamp": latest_mtime,
+                "updated_at": readable_time,
             }
             results.append(folder_data)
             results.sort(key=lambda x: x["size"], reverse=True)
-
             if save_results:
                 save_intermediate_results(
                     results,
@@ -123,13 +196,10 @@ def find_large_folders(
                     kwargs.get("max_backward_depth"),
                     min_depth,
                 )
-
             yield folder_data
-
             if delete_folders:
                 logger.warning(f"Deleting folder: {folder}")
                 shutil.rmtree(folder, ignore_errors=True)
-
     pbar.close()
     logger.info(
         f"🏁 Scan complete. Processed {total_folders} large folders (min_depth filter: {min_depth})"
@@ -180,7 +250,7 @@ def get_command() -> str:
     transformed_args = []
     for arg in arg_list:
         try:
-            int(arg)  # Numeric args stay as-is
+            int(arg)
             transformed_args.append(arg)
         except ValueError:
             if arg.startswith("-"):
@@ -281,17 +351,12 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of yielded results (not implemented yet).",
     )
-
     args = parser.parse_args()
-
-    # DEBUG: Log parsed arguments (from @file_context_0)
     logger.debug(
         f"[ARGS PARSED] min_depth={args.min_depth}, max_depth={args.max_depth}, base_dir={args.base_dir}"
     )
-
     command = get_command()
     logger.log("COMMAND:", command or "[]", colors=["WHITE", "INFO"])
-
     includes = [p.strip() for p in args.includes.split(",") if p.strip()]
     excludes = [p.strip() for p in args.excludes.split(",") if p.strip()]
     exclude_nested = []
@@ -299,9 +364,7 @@ if __name__ == "__main__":
         exclude_nested = [
             p.strip() for p in args.exclude_nested.split(",") if p.strip()
         ]
-
     output_file = args.output_file or os.path.join(args.base_dir, "_large_folders.json")
-
     results = []
     generator = find_large_folders(
         base_dir=args.base_dir,
@@ -317,16 +380,12 @@ if __name__ == "__main__":
         output_file=output_file,
         save=args.save,
     )
-
     logger.info(f"Output file: {output_file}")
-
     for folder_data in generator:
         results.append(folder_data)
         results.sort(key=lambda x: x["size"], reverse=True)
-
     total_size_mb = calculate_total_size(results)
     formatted_total = format_size(total_size_mb)
-
     if args.save:
         final_results = {
             "file": output_file,
@@ -339,7 +398,6 @@ if __name__ == "__main__":
             "results": results,
         }
         save_file(final_results, output_file)
-
     if args.delete:
         print(f"Total Freed Space: {formatted_total}")
     else:
