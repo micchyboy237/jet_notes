@@ -39,20 +39,51 @@ llama-server \
 
 # https://huggingface.co/Qwen/Qwen3.5-2B
 llama-server \
-  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/Qwen3.5-2B-Q4_K_M.gguf" \
-  -ngl all \
-  -c 16384 \
-  -b 1024 \
-  -ub 512 \
-  --threads 4 \
-  --threads-batch 4 \
+  -m model.gguf \
+  -ngl 20 \
+  -c 4096 \
+  -b 256 \
+  -ub 128 \
+  --threads 6 \
+  --threads-batch 6 \
   --flash-attn on \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
   --cont-batching \
-  --cache-type-k q8_0 \
-  --cache-type-v q8_0 \
-  --cache-prompt \
-  --mlock \
-  --no-mmap \
-  --jinja \
+  --host 0.0.0.0 \
+  --port 8080
+
+# https://huggingface.co/Qwen/Qwen3.5-2B
+# llama-server \
+#   -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/Qwen3.5-2B-Q4_K_M.gguf" \
+#   -ngl all \
+#   -c 16384 \
+#   -b 1024 \
+#   -ub 512 \
+#   --threads 4 \
+#   --threads-batch 4 \
+#   --flash-attn on \
+#   --cont-batching \
+#   --cache-type-k q8_0 \
+#   --cache-type-v q8_0 \
+#   --cache-prompt \
+#   --mlock \
+#   --no-mmap \
+#   --jinja \
+#   --host 0.0.0.0 \
+#   --port 8080
+
+llama-server \
+  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/Qwen3.5-2B-Q4_K_M.gguf" \
+  -ngl 20 \
+  -c 4096 \
+  -b 256 \
+  -ub 128 \
+  --threads 6 \
+  --threads-batch 8 \
+  --flash-attn on \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --cont-batching \
   --host 0.0.0.0 \
   --port 8080
