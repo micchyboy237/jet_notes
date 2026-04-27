@@ -1,18 +1,22 @@
-from typing import Generator, List, Optional
-import os
-import shutil
 import argparse
 import fnmatch
-from tqdm import tqdm
+import os
+import shutil
+from typing import Generator, List, Optional
+
 from jet.file import traverse_directory
 from jet.file.utils import save_file
 from jet.logger import logger
+from tqdm import tqdm
 
 
 def match_patterns(file_path: str, patterns: List[str]) -> bool:
     """Check if a file path matches any of the given patterns (case-insensitive)."""
     normalized_path = os.path.normpath(file_path).lower()
-    return any(fnmatch.fnmatch(normalized_path, f"*{os.path.normpath(p).lower()}") for p in patterns)
+    return any(
+        fnmatch.fnmatch(normalized_path, f"*{os.path.normpath(p).lower()}")
+        for p in patterns
+    )
 
 
 def get_size(file_path: str) -> int:
@@ -38,8 +42,10 @@ def find_large_folders(
     includes: List[str],
     excludes: List[str],
     min_size_mb: int,
+    exclude_nested: List[str] = [],
     delete_folders: bool = False,
     depth: Optional[int] = None,
+    min_depth: Optional[int] = None,
     **kwargs,
 ) -> Generator[dict, None, List[dict]]:
     """Find folders larger than min_size_mb and optionally delete them.
@@ -48,7 +54,19 @@ def find_large_folders(
     """
     results: List[dict] = []
     base_dir = os.path.expanduser(base_dir)
-    output_file: str = kwargs.pop("output_file", os.path.join(base_dir, "_large_folders.json"))
+
+    # DEBUG: Log filter parameters at startup
+    logger.debug(
+        f"[FILTER SETUP] min_depth={min_depth}, max_depth={depth}, base_dir={base_dir}"
+    )
+    if min_depth is not None:
+        logger.info(
+            f"🎯 Depth filter active: only including folders with depth >= {min_depth}"
+        )
+
+    output_file: str = kwargs.pop(
+        "output_file", os.path.join(base_dir, "_large_folders.json")
+    )
     save_results: bool = kwargs.pop("save", False)
 
     total_folders = 0
@@ -57,23 +75,54 @@ def find_large_folders(
     # Configure traversal depth/direction
     direction: str = kwargs.get("direction", "forward")
     kwargs["max_forward_depth"] = depth if direction in ("forward", "both") else None
-    kwargs["max_backward_depth"] = kwargs.get("max_backward_depth") if direction in ("backward", "both") else None
+    kwargs["max_backward_depth"] = (
+        kwargs.get("max_backward_depth") if direction in ("backward", "both") else None
+    )
 
-    for folder, current_depth in traverse_directory(base_dir, includes, excludes, **kwargs):
+    for folder, current_depth in traverse_directory(
+        base_dir, includes, excludes, exclude_nested=exclude_nested, **kwargs
+    ):
+        # DEBUG: Log every folder encountered
+        logger.debug(f"[TRAVERSAL] Found: {folder} | depth={current_depth}")
+
+        # ⭐ CRITICAL FILTER: Skip folders shallower than min_depth
+        if min_depth is not None and current_depth < min_depth:
+            # DEBUG: Explicit log when skipping
+            logger.debug(
+                f"⏭️  SKIP (depth {current_depth} < min_depth {min_depth}): {folder}"
+            )
+            continue
+
+        # DEBUG: Confirm folder passed depth filter
+        logger.debug(f"✅ PASS depth filter: {folder} (depth={current_depth})")
+
         folder_size_mb = get_folder_sizes(folder)
+        logger.debug(f"📊 Calculated size: {folder_size_mb:.2f} MB for {folder}")
+
         if folder_size_mb >= min_size_mb:
             total_folders += 1
             pbar.set_postfix({"Depth": current_depth, "Large folders": total_folders})
             pbar.update(1)
-
-            logger.success(f"\nSize: {format_size(folder_size_mb)} | Folder: {folder}")
-
-            folder_data = {"size": folder_size_mb, "file": folder, "depth": current_depth}
+            logger.success(
+                f"\n📁 LARGE FOLDER | Size: {format_size(folder_size_mb)} | Depth: {current_depth} | {folder}"
+            )
+            folder_data = {
+                "size": folder_size_mb,
+                "file": folder,
+                "depth": current_depth,
+            }
             results.append(folder_data)
             results.sort(key=lambda x: x["size"], reverse=True)
 
             if save_results:
-                save_intermediate_results(results, output_file, min_size_mb, depth, kwargs.get("max_backward_depth"))
+                save_intermediate_results(
+                    results,
+                    output_file,
+                    min_size_mb,
+                    depth,
+                    kwargs.get("max_backward_depth"),
+                    min_depth,
+                )
 
             yield folder_data
 
@@ -82,6 +131,9 @@ def find_large_folders(
                 shutil.rmtree(folder, ignore_errors=True)
 
     pbar.close()
+    logger.info(
+        f"🏁 Scan complete. Processed {total_folders} large folders (min_depth filter: {min_depth})"
+    )
     return results
 
 
@@ -91,6 +143,7 @@ def save_intermediate_results(
     min_size_mb: int,
     depth: Optional[int],
     max_backward_depth: Optional[int],
+    min_depth: Optional[int] = None,
 ) -> None:
     """Save current results to JSON (used for live updates during long scans)."""
     final_results = {
@@ -99,6 +152,7 @@ def save_intermediate_results(
         "min_size_mb": min_size_mb,
         "depth": depth,
         "max_backward_depth": max_backward_depth,
+        "min_depth": min_depth,
         "count": len(results),
         "results": results,
     }
@@ -138,38 +192,113 @@ def get_command() -> str:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Find and optionally delete large folders.")
-    parser.add_argument("-b", "--base-dir", type=str, default=os.getcwd(),
-                        help="Base directory to search. Defaults to current working directory.")
-    parser.add_argument("-s", "--min-size", type=int, default=50,
-                        help="Minimum size (MB) to consider a folder large.")
-    parser.add_argument("-d", "--max-depth", type=int, default=None,
-                        help="Maximum forward depth. Set to 0 for immediate subdirectories only.")
-    parser.add_argument("-i", "--includes", type=str,
-                        default="*cache*,*Cache*,*CACHE*,*tmp*,*Temp*,.TemporaryItems,Temporary Files,.Spotlight-V100,.fseventsd,.DS_Store,Logs,DerivedData,generated,node_modules,__pycache__,dist,build,.venv,*_venv,.pytest_cache",
-                        help="Comma-separated include patterns.")
-    parser.add_argument("-e", "--excludes", type=str, default="",
-                        help="Comma-separated exclude patterns.")
-    parser.add_argument("-f", "--output-file", type=str, default=None,
-                        help="Optional JSON output file path.")
-    parser.add_argument("--max-backward-depth", type=int, default=None,
-                        help="Maximum upward depth when direction is backward or both.")
-    parser.add_argument("--delete", action="store_true",
-                        help="Delete matched folders (dangerous – use with caution).")
-    parser.add_argument("--save", action="store_true",
-                        help="Save results to JSON file (updates live during scan).")
-    parser.add_argument("--direction", type=str, choices=["forward", "backward", "both"],
-                        default="forward", help="Traversal direction.")
-    parser.add_argument("-l", "--limit", type=int, default=None,
-                        help="Limit number of yielded results (not implemented yet).")
+    parser = argparse.ArgumentParser(
+        description="Find and optionally delete large folders."
+    )
+    parser.add_argument(
+        "-b",
+        "--base-dir",
+        type=str,
+        default=os.getcwd(),
+        help="Base directory to search. Defaults to current working directory.",
+    )
+    parser.add_argument(
+        "-s",
+        "--min-size",
+        type=int,
+        default=50,
+        help="Minimum size (MB) to consider a folder large.",
+    )
+    parser.add_argument(
+        "-d",
+        "--max-depth",
+        type=int,
+        default=None,
+        help="Maximum forward depth. Set to 0 for immediate subdirectories only.",
+    )
+    parser.add_argument(
+        "-md",
+        "--min-depth",
+        type=int,
+        default=0,
+        help="Minimum depth to include. Folders with depth < this value will be excluded.",
+    )
+    parser.add_argument(
+        "-i",
+        "--includes",
+        type=str,
+        default="*cache*,*Cache*,*CACHE*,*tmp*,*Temp*,.TemporaryItems,Temporary Files,.Spotlight-V100,.fseventsd,.DS_Store,Logs,DerivedData,generated,node_modules,__pycache__,dist,build,.venv,*_venv,.pytest_cache",
+        help="Comma-separated include patterns.",
+    )
+    parser.add_argument(
+        "-e",
+        "--excludes",
+        type=str,
+        default="",
+        help="Comma-separated exclude patterns.",
+    )
+    parser.add_argument(
+        "-n",
+        "--exclude-nested",
+        type=str,
+        default=None,
+        help="Comma-separated folder names that will not be descended into (exact name match).",
+    )
+    parser.add_argument(
+        "-f",
+        "--output-file",
+        type=str,
+        default=None,
+        help="Optional JSON output file path.",
+    )
+    parser.add_argument(
+        "--max-backward-depth",
+        type=int,
+        default=None,
+        help="Maximum upward depth when direction is backward or both.",
+    )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete matched folders (dangerous – use with caution).",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save results to JSON file (updates live during scan).",
+    )
+    parser.add_argument(
+        "--direction",
+        type=str,
+        choices=["forward", "backward", "both"],
+        default="forward",
+        help="Traversal direction.",
+    )
+    parser.add_argument(
+        "-l",
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of yielded results (not implemented yet).",
+    )
 
     args = parser.parse_args()
+
+    # DEBUG: Log parsed arguments (from @file_context_0)
+    logger.debug(
+        f"[ARGS PARSED] min_depth={args.min_depth}, max_depth={args.max_depth}, base_dir={args.base_dir}"
+    )
 
     command = get_command()
     logger.log("COMMAND:", command or "[]", colors=["WHITE", "INFO"])
 
     includes = [p.strip() for p in args.includes.split(",") if p.strip()]
     excludes = [p.strip() for p in args.excludes.split(",") if p.strip()]
+    exclude_nested = []
+    if args.exclude_nested:
+        exclude_nested = [
+            p.strip() for p in args.exclude_nested.split(",") if p.strip()
+        ]
 
     output_file = args.output_file or os.path.join(args.base_dir, "_large_folders.json")
 
@@ -178,9 +307,11 @@ if __name__ == "__main__":
         base_dir=args.base_dir,
         includes=includes,
         excludes=excludes,
+        exclude_nested=exclude_nested,
         min_size_mb=args.min_size,
         delete_folders=args.delete,
         depth=args.max_depth,
+        min_depth=args.min_depth,
         direction=args.direction,
         max_backward_depth=args.max_backward_depth,
         output_file=output_file,
@@ -203,6 +334,7 @@ if __name__ == "__main__":
             "min_size_mb": args.min_size,
             "depth": args.max_depth,
             "max_backward_depth": args.max_backward_depth,
+            "min_depth": args.min_depth,
             "count": len(results),
             "results": results,
         }
