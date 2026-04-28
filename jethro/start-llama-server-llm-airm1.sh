@@ -5,8 +5,6 @@ llama-server \
   --ctx-size 4096 \
   --n-gpu-layers all \
   --flash-attn on \
-  --threads 4 \
-  --threads-batch 4 \
   --batch-size 1024 \
   --ubatch-size 512 \
   --mlock \
@@ -27,8 +25,6 @@ llama-server \
   --ctx-size 4096 \
   --n-gpu-layers all \
   --flash-attn on \
-  --threads 4 \
-  --threads-batch 4 \
   --batch-size 1024 \
   --ubatch-size 512 \
   --mlock \
@@ -47,8 +43,6 @@ llama-server \
   -c 4096 \
   -b 1024 \
   -ub 512 \
-  --threads 4 \
-  --threads-batch 4 \
   --cont-batching \
   --cache-prompt \
   -fa auto \
@@ -65,8 +59,6 @@ llama-server \
   -c 4096 \
   -b 256 \
   -ub 128 \
-  --threads 6 \
-  --threads-batch 6 \
   --flash-attn on \
   --cache-type-k q4_0 \
   --cache-type-v q4_0 \
@@ -82,8 +74,6 @@ llama-server \
   -c 16384 \
   -b 1024 \
   -ub 512 \
-  --threads 6 \
-  --threads-batch 8 \
   --flash-attn on \
   --cont-batching \
   --cache-type-k q8_0 \
@@ -101,8 +91,6 @@ llama-server \
 #   -c 4096 \
 #   -b 256 \
 #   -ub 128 \
-#   --threads 6 \
-#   --threads-batch 8 \
 #   --flash-attn on \
 #   --cache-type-k q4_0 \
 #   --cache-type-v q4_0 \
