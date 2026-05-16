@@ -85,11 +85,11 @@ llama-server \
   --port 8080
 
 
-# https://huggingface.co/Qwen/Qwen3.5-2B
+# https://huggingface.co/Qwen/Qwen3.5-0.8B
 llama-server \
   -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/Qwen3.5-0.8B-Q4_K_M.gguf" \
   -ngl all \
-  -c 16384 \
+  -c 8192 \
   -b 1024 \
   -ub 512 \
   --flash-attn on \
