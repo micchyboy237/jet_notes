@@ -115,3 +115,41 @@ llama-server \
 #   --cont-batching \
 #   --host 0.0.0.0 \
 #   --port 8080
+
+
+# https://huggingface.co/HauhauCS/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive
+llama-server \
+  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/nsfw/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" \
+  -ngl 99 \
+  -c 8192 \
+  -b 1024 \
+  -ub 512 \
+  --flash-attn on \
+  --cont-batching \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --cache-prompt \
+  --mlock \
+  --no-mmap \
+  --jinja \
+  --host 0.0.0.0 \
+  --port 8080
+
+
+# https://huggingface.co/mradermacher/Gemma3-UNCENSORED-1B-GGUF
+llama-server \
+  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/nsfw/Gemma3-UNCENSORED-1B.Q4_K_M.gguf" \
+  -ngl 99 \
+  -c 8192 \
+  -b 1024 \
+  -ub 512 \
+  --flash-attn on \
+  --cont-batching \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --cache-prompt \
+  --mlock \
+  --no-mmap \
+  --jinja \
+  --host 0.0.0.0 \
+  --port 8080
