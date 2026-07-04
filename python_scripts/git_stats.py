@@ -1,7 +1,6 @@
 import argparse
 import fnmatch
 import os
-import re
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
@@ -24,37 +23,6 @@ def find_git_repos(base_dir: str) -> list[str]:
             repos.append(root)
             dirs[:] = []  # don’t descend further once repo is found
     return repos
-
-
-def generate_unique_output_filename(
-    base_dir: str,
-    extensions: Optional[List[str]] = None,
-    mode: Literal["auto", "git", "file"] = "auto",
-    type_filter: Literal["files", "dirs", "both"] = "both",
-    file_pattern: Optional[str] = None,
-    depth: Optional[int] = None,
-    is_git_repo: bool = False,
-) -> str:
-    """Generate a deterministic output filename in a _stats_results subdirectory."""
-    repo_name = os.path.basename(os.path.abspath(base_dir)).replace(os.sep, "_")
-    mode_str = mode
-    type_str = type_filter
-    ext_str = f"_ext_{'_'.join(sorted(extensions))}" if extensions else ""
-    pattern_str = (
-        f"_pattern_{re.sub(r'[^a-zA-Z0-9._-]', '_', file_pattern)}"
-        if file_pattern
-        else ""
-    )
-    depth_str = f"_depth_{depth}" if depth is not None else ""
-    base_filename = (
-        f"_git_stats_{repo_name}_{mode_str}_{type_str}{ext_str}{pattern_str}{depth_str}.json"
-        if is_git_repo
-        else f"_file_stats_{repo_name}_{mode_str}_{type_str}{ext_str}{pattern_str}{depth_str}.json"
-    )
-
-    output_dir = os.path.join(base_dir, "_stats_results")
-    os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, base_filename)
 
 
 def check_is_git_repo(base_dir: str) -> bool:
@@ -414,28 +382,21 @@ def process_file_mode(
     raw_results, is_git_repo = get_last_commit_dates_optimized(
         base_dir, extensions, depth, None, mode, type_filter, file_pattern
     )
-
     updates = filter_and_sort_results(raw_results, since=since, sort_by=sort_by)
-
     base_output_file = os.path.join(base_dir, "_file_stats.json")
-    output_file = output_file or generate_unique_output_filename(
-        base_dir, extensions, mode, type_filter, file_pattern, depth, is_git_repo
-    )
-
+    output_file = (
+        output_file or base_output_file
+    )  # REMOVED: generate_unique_output_filename call
     print("\nTop 10 most recent/relevant items:")
     for item in updates[:10]:
         print(
             f"{item['rank']:3d}. {item['rel_path']} "
             f"({item['type']}, depth={item['depth']}): {item['updated_at']}"
         )
-
     for item in updates:
         if "path" in item:
             item["path"] = os.path.abspath(item["path"])
-
     save_file(updates, output_file)
-    save_file(updates, base_output_file)
-    print(f"\nFile stats saved to: {base_output_file}")
 
 
 def process_repo(
@@ -452,25 +413,18 @@ def process_repo(
     raw_results, is_git_repo = get_last_commit_dates_optimized(
         repo_dir, extensions, depth, None, mode, type_filter, file_pattern
     )
-
     updates = filter_and_sort_results(raw_results, since=since, sort_by=sort_by)
-
     base_output_file = os.path.join(
         repo_dir,
         "_git_stats.json" if is_git_repo and mode != "file" else "_file_stats.json",
     )
-
-    output_file = output_file or generate_unique_output_filename(
-        repo_dir, extensions, mode, type_filter, file_pattern, depth, is_git_repo
-    )
-
+    output_file = (
+        output_file or base_output_file
+    )  # REMOVED: generate_unique_output_filename call
     for item in updates:
         if "path" in item:
             item["path"] = os.path.abspath(item["path"])
-
     save_file(updates, output_file)
-    save_file(updates, base_output_file)
-    print(f"Repo stats saved to: {base_output_file}")
     return updates
 
 
@@ -488,16 +442,9 @@ def process_combined(
 ):
     combined = []
     base_combined_file = os.path.join(base_dir, "_combined_stats.json")
-    combined_file = output_file or os.path.join(
-        base_dir,
-        "_stats_results",
-        os.path.basename(
-            generate_unique_output_filename(
-                base_dir, extensions, mode, type_filter, file_pattern, depth, True
-            )
-        ).replace("_git_stats_", "_combined_git_stats_"),
-    )
-
+    combined_file = (
+        output_file or base_combined_file
+    )  # REMOVED: _stats_results folder reference
     for repo_dir in repos:
         print(f"\n=== Scanning repo: {repo_dir} ===")
         updates = process_repo(
@@ -512,14 +459,10 @@ def process_combined(
             sort_by,
         )
         combined.extend(updates)
-
-    # Final sort & rank for combined results
     combined = filter_and_sort_results(combined, since=since, sort_by=sort_by)
-
     for item in combined:
         if "path" in item:
             item["path"] = os.path.abspath(item["path"])
-
     save_file(combined, combined_file)
     save_file(combined, base_combined_file)
     print(f"\nCombined stats saved to: {base_combined_file}")
