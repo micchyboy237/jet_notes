@@ -5,26 +5,26 @@ import json
 import logging
 import os
 import re
-import subprocess
-from collections.abc import Generator, Iterator
+from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
+from git_repo_utils import (
+    RepoInfo,
+    get_remote_origin_url,
+    get_repo_info,
+    is_git_repository,
+)
 from rich.console import Console
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
-
 console = Console()
 
 
 def get_args() -> argparse.Namespace:
     """
     Parse command line arguments using argparse.
-
     Returns:
         argparse.Namespace with parsed arguments
     """
@@ -35,31 +35,28 @@ def get_args() -> argparse.Namespace:
 Examples:
   # Find all repos
   python git_repo_finder.py /home/user/projects
-  
   # Find repos under specific user/organization
   python git_repo_finder.py /home/user/projects --user microsoft
-  
   # Find repos with short flag
   python git_repo_finder.py . -u microsoft
-  
+  # Find repos sorted by size (smallest first)
+  python git_repo_finder.py . -s asc
+  # Find repos sorted by size and save to custom JSON file
+  python git_repo_finder.py . -s desc -o my_repos.json
   # Find repos without following symlinks (default)
   python git_repo_finder.py /opt/repos --user github
-  
   # Follow symlinks while searching
   python git_repo_finder.py /opt/repos --follow-symlinks
-  
   # Debug mode to see all repositories and their remote URLs
   python git_repo_finder.py . --user microsoft --verbose
         """,
     )
-
     parser.add_argument(
         "directory",
         nargs="?",
         default=".",
         help="Root directory to start searching from (default: current directory)",
     )
-
     parser.add_argument(
         "-u",
         "--user",
@@ -67,15 +64,13 @@ Examples:
         default=None,
         help="Filter repositories by username/organization from remote URL (case-insensitive)",
     )
-
     parser.add_argument(
-        "-s",
+        "-S",
         "--follow-symlinks",
         action="store_true",
         default=False,
         help="Follow symbolic links when traversing directories",
     )
-
     parser.add_argument(
         "-v",
         "--verbose",
@@ -83,117 +78,69 @@ Examples:
         default=False,
         help="Enable verbose/debug logging output and show all repositories with remote URLs",
     )
-
+    parser.add_argument(
+        "-s",
+        "--sort-by-size",
+        dest="sort_by_size",
+        choices=["asc", "desc"],
+        default=None,
+        help="Sort repositories by .git folder size "
+        "(asc: smallest first, desc: largest first)",
+    )
+    parser.add_argument(
+        "-o",
+        "--out",
+        dest="out",
+        type=Path,
+        help="Save results to custom JSON file path",
+    )
     args = parser.parse_args()
-
-    # Configure logging level based on verbose flag
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
         logger.debug("Verbose logging enabled")
-
     logger.info(
         f"Parsed arguments: directory={args.directory}, user={args.user}, "
-        f"follow_symlinks={args.follow_symlinks}, verbose={args.verbose}"
+        f"follow_symlinks={args.follow_symlinks}, verbose={args.verbose}, "
+        f"sort_by_size={args.sort_by_size}, out={args.out}"
     )
-
     return args
-
-
-def is_git_repository(path: Path) -> bool:
-    """
-    Check if the given path is the root of a git repository.
-    Looks for .git/HEAD file (most reliable lightweight check).
-    """
-    return (path / ".git" / "HEAD").is_file()
-
-
-def get_remote_origin_url(repo_path: Path) -> str | None:
-    """
-    Get the remote origin URL for a git repository.
-
-    Args:
-        repo_path: Path to the git repository
-
-    Returns:
-        Remote origin URL string or None if not found/error
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            url = result.stdout.strip()
-            logger.debug(f"Remote URL for {repo_path}: {url}")
-            return url
-        else:
-            logger.debug(f"No remote origin found for {repo_path}")
-            return None
-
-    except subprocess.TimeoutExpired:
-        logger.debug(f"Timeout getting remote URL for {repo_path}")
-        return None
-    except Exception as e:
-        logger.debug(f"Error getting remote URL for {repo_path}: {e}")
-        return None
 
 
 def linkify(path: str | Path) -> str:
     """
     Create a clickable file link for terminal display.
-
     Args:
         path: File path to create link for
-
     Returns:
         Rich-formatted clickable link string
     """
     path = Path(path)
-    # Provide clickable file link with basename (for rich/terminal that support it)
     return f"[bold blue][link=file://{path}]{path.name}[/link][/bold blue]"
 
 
 def _matches_user_filter(repo_path: Path, user: str) -> bool:
     """
     Check if the repository's remote origin URL matches the user filter.
-
     Args:
         repo_path: Path to the git repository
         user: Lowercase username/organization to match against
-
     Returns:
         True if the remote URL contains the user/organization
     """
     remote_url = get_remote_origin_url(repo_path)
-
     if not remote_url:
         logger.debug(f"No remote URL for {repo_path}, cannot match filter")
         return False
 
-    # Normalize both for comparison
     user_lower = user.lower()
     url_lower = remote_url.lower()
 
-    # Check for the user/organization in the URL
-    # This handles various URL formats:
-    # https://github.com/microsoft/vscode.git
-    # git@github.com:microsoft/vscode.git
-    # https://github.com/Microsoft/TypeScript
-
-    # Check if the user appears as a path component in the URL
     if f"/{user_lower}/" in url_lower:
         logger.debug(f"Match found: '{user}' in URL path: {remote_url}")
         return True
-
-    # Check for git@ format: git@github.com:user/repo.git
     if f":{user_lower}/" in url_lower:
         logger.debug(f"Match found: '{user}' in git URL: {remote_url}")
         return True
-
-    # Check if the URL ends with user/repo format
     if url_lower.endswith(f"/{user_lower}") or url_lower.endswith(f":{user_lower}"):
         logger.debug(f"Match found: '{user}' at end of URL: {remote_url}")
         return True
@@ -208,38 +155,65 @@ def find_git_repositories(
     follow_symlinks: bool = False,
     user: str | None = None,
     verbose: bool = False,
-) -> Iterator[Path]:
+    sort_by_size: str | None = None,
+    include_size: bool = False,
+    include_branch: bool = False,
+    include_commit_date: bool = False,
+    include_uncommitted: bool = False,
+    include_commit_count: bool = False,
+    check_remote_tracking: bool = False,
+    require_remote: bool = False,
+) -> Iterator[RepoInfo]:
     """
-    Recursively find all git repositories under base_dir.
+    Recursively find all git repositories under base_dir with comprehensive info.
 
     Args:
         base_dir: Root directory to start searching from
         follow_symlinks: Whether to follow symbolic links
         user: Optional username/organization filter to match in remote URL
         verbose: Whether to show all repositories for debugging
+        sort_by_size: Sort repos by .git size before yielding ("asc" or "desc")
+        include_size: Calculate .git directory size
+        include_branch: Get current branch name
+        include_commit_date: Get last commit date
+        include_uncommitted: Check for uncommitted changes
+        include_commit_count: Get total commit count
+        check_remote_tracking: Check if upstream is configured
+        require_remote: Only yield repos that have a remote origin URL
 
     Optimization:
         - Once a .git folder is found, we SKIP walking inside that directory
-          (no need to look for nested repos unless you explicitly want them)
+        - All repository info gathering is done here, not in callers
 
     Yields:
-        Absolute paths to git repository roots that match the filter
+        RepoInfo dataclasses for matching repositories (sorted if sort_by_size is set)
     """
     base_path = Path(base_dir).resolve()
-
     if not base_path.is_dir():
         logger.error(f"Not a directory: {base_path}")
         raise NotADirectoryError(f"Not a directory: {base_path}")
 
     logger.info(f"Starting repository search in: {base_path}")
-
     if user:
         logger.info(f"Applying user filter based on remote URL: '{user}'")
+    if sort_by_size:
+        logger.info(f"Will sort repositories by size: {sort_by_size}")
 
+    # Handle case where base_path itself is a git repo
     if is_git_repository(base_path):
         if not user or _matches_user_filter(base_path, user):
             logger.info(f"Base path itself is a git repository: {base_path}")
-            yield base_path
+            info = get_repo_info(
+                base_path,
+                include_size=include_size or sort_by_size is not None,
+                include_branch=include_branch,
+                include_commit_date=include_commit_date,
+                include_uncommitted=include_uncommitted,
+                include_commit_count=include_commit_count,
+                check_remote_tracking=check_remote_tracking,
+            )
+            if not require_remote or info.remote_url:
+                yield info
         return
 
     visited: set[Path] = set()
@@ -247,7 +221,7 @@ def find_git_repositories(
     total_repos_found = 0
     no_remote_count = 0
 
-    def walk(start: Path) -> Generator[Path, None, None]:
+    def walk(start: Path) -> Generator[RepoInfo, None, None]:
         nonlocal filtered_count, total_repos_found, no_remote_count
         try:
             for entry in os.scandir(start):
@@ -262,10 +236,9 @@ def find_git_repositories(
                             resolved_path = entry_path.resolve()
                             total_repos_found += 1
 
-                            # Get remote URL for debugging
+                            # Get remote URL early for filtering
                             remote_url = get_remote_origin_url(resolved_path)
 
-                            # Print ALL repositories in verbose mode for debugging
                             if verbose:
                                 console.print(
                                     f"  [dim]Found repo: {resolved_path.name}[/dim]"
@@ -278,7 +251,7 @@ def find_git_repositories(
                                     console.print("  [dim]No remote origin[/dim]")
                                     no_remote_count += 1
 
-                            # Apply user filter if specified
+                            # Apply user filter
                             if user:
                                 if not remote_url:
                                     filtered_count += 1
@@ -290,7 +263,6 @@ def find_git_repositories(
                                             "  [yellow]✗ Filtered out (no remote URL)[/yellow]"
                                         )
                                     continue
-
                                 if not _matches_user_filter(resolved_path, user):
                                     filtered_count += 1
                                     logger.debug(f"Filtered out: {resolved_path}")
@@ -300,24 +272,58 @@ def find_git_repositories(
                                         )
                                     continue
 
+                            # Apply require_remote filter
+                            if require_remote and not remote_url:
+                                filtered_count += 1
+                                logger.debug(
+                                    f"Filtered out (require_remote=True, no URL): {resolved_path}"
+                                )
+                                continue
+
                             if verbose and user:
                                 console.print("  [green]✓ Matches filter[/green]")
 
+                            # Gather all requested info
+                            repo_info = get_repo_info(
+                                resolved_path,
+                                include_size=include_size or sort_by_size is not None,
+                                include_branch=include_branch,
+                                include_commit_date=include_commit_date,
+                                include_uncommitted=include_uncommitted,
+                                include_commit_count=include_commit_count,
+                                check_remote_tracking=check_remote_tracking,
+                            )
+
                             logger.debug(f"Found matching repository: {resolved_path}")
-                            yield resolved_path
+                            yield repo_info
                             continue
 
                         yield from walk(entry_path)
-
                 except (PermissionError, OSError) as e:
                     logger.debug(f"Permission denied for: {entry.path} - {e}")
                     continue
-
         except (PermissionError, OSError) as e:
             logger.debug(f"Cannot access directory: {start} - {e}")
 
-    yield from walk(base_path)
+    # If sorting is requested, collect all repos first
+    if sort_by_size:
+        repos_buffer = list(walk(base_path))
 
+        # Sort by size (None values go last for asc, first for desc)
+        def sort_key(info: RepoInfo) -> tuple[bool, int]:
+            """Sort key: (is_none, size) - None sizes go last."""
+            return (info.size_bytes is None, info.size_bytes or 0)
+
+        reverse = sort_by_size == "desc"
+        repos_buffer.sort(key=sort_key, reverse=reverse)
+
+        logger.info(f"Sorted {len(repos_buffer)} repositories by size ({sort_by_size})")
+
+        yield from repos_buffer
+    else:
+        yield from walk(base_path)
+
+    # Log summary statistics
     logger.info(f"Total repositories found: {total_repos_found}")
     if no_remote_count > 0:
         logger.info(f"Repositories without remote origin: {no_remote_count}")
@@ -331,40 +337,39 @@ def find_git_repositories(
 def save_results_to_json(
     results: list[dict],
     target_dir: Path,
-    user_filter: str | None = None,
+    input_config: dict[str, str | bool | None],
+    output_path: Path | None = None,
 ) -> Path:
     """
     Save repository results to a JSON file in the target directory.
-    Always overwrites the same file: git_repos_results.json
-
+    Overwrites the same file unless custom output path is provided.
     Args:
         results: List of repository info dictionaries
         target_dir: Directory to save the JSON file
-        user_filter: Optional user filter that was applied
-
+        input_config: Dictionary containing input configuration (user_filter, etc.)
+        output_path: Optional custom output file path
     Returns:
         Path to the saved JSON file
     """
-    # Always use the same filename - overwrites on each run
-    json_filename = "git_repos_results.json"
-    json_path = target_dir / json_filename
+    if output_path:
+        json_path = output_path.resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        json_filename = "_git_repos_results.json"
+        json_path = target_dir / json_filename
 
-    # Prepare data for JSON
     json_data = {
         "search_directory": str(target_dir),
-        "user_filter": user_filter,
+        "input": input_config,
         "timestamp": datetime.now().isoformat(),
         "total_repositories": len(results),
         "repositories": results,
     }
-
     try:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(json_data, f, indent=2, ensure_ascii=False)
-
         logger.info(f"Results saved to: {json_path}")
         return json_path
-
     except Exception as e:
         logger.error(f"Failed to save JSON file: {e}")
         raise
@@ -375,15 +380,22 @@ def print_git_repositories(
     follow_symlinks: bool = False,
     user: str | None = None,
     verbose: bool = False,
+    sort_by_size: str | None = None,
+    output_path: Path | None = None,
 ) -> None:
     """
     Print all found git repositories with optional user filtering.
+
+    This is now a thin wrapper around find_git_repositories that handles
+    display formatting and JSON output.
 
     Args:
         base_dir: Root directory to start searching from
         follow_symlinks: Whether to follow symbolic links
         user: Optional username/organization filter based on remote URL
         verbose: Whether to show verbose output
+        sort_by_size: Sort repos by .git size ("asc" or "desc")
+        output_path: Optional custom output file path
     """
     filter_msg = f" (filtered by remote URL: {user})" if user else ""
     console.print(
@@ -395,81 +407,96 @@ def print_git_repositories(
             "[yellow]Verbose mode: Showing all repositories and filtering decisions[/yellow]\n"
         )
 
+    # All the heavy lifting is now in find_git_repositories
+    repos = list(
+        find_git_repositories(
+            base_dir,
+            follow_symlinks=follow_symlinks,
+            user=user,
+            verbose=verbose,
+            sort_by_size=sort_by_size,
+            include_size=True,  # Always include size for display
+            require_remote=True,  # Only show repos with remote URLs
+        )
+    )
+
+    # Display sorting info if requested
+    if sort_by_size and repos:
+        console.print("[bold]Repositories sorted by size:[/bold]")
+        for i, repo_info in enumerate(repos, 1):
+            console.print(f"  {i:3d}. {repo_info.name:40s} → {repo_info.size_display}")
+        console.print()
+
+    # Display and collect results
     results = []
-    count = 0
+    for repo_info in repos:
+        clickable_name = linkify(repo_info.path)
+        size_suffix = (
+            f" [dim]({repo_info.size_human})[/dim]" if repo_info.size_human else ""
+        )
 
-    for repo in find_git_repositories(
-        base_dir, follow_symlinks=follow_symlinks, user=user, verbose=verbose
-    ):
-        # Get remote URL for display
-        remote_url = get_remote_origin_url(repo)
-
-        # Create clickable link for the repository name
-        clickable_name = linkify(repo)
-
-        if remote_url:
-            # Highlight user in URL if filter is applied
-            if user:
-                highlighted_url = _highlight_user_in_url(remote_url, user)
-                console.print(f"  • {clickable_name} -> {highlighted_url}")
-            else:
-                console.print(f"  • {clickable_name} -> {remote_url}")
+        if user and repo_info.remote_url:
+            highlighted_url = _highlight_user_in_url(repo_info.remote_url, user)
+            console.print(f"  • {clickable_name}{size_suffix} -> {highlighted_url}")
         else:
-            console.print(f"  • {clickable_name} -> [yellow]No remote origin[/yellow]")
+            console.print(
+                f"  • {clickable_name}{size_suffix} -> {repo_info.remote_url or 'No remote'}"
+            )
 
-        # Collect results for JSON
-        results.append({"name": repo.name, "path": str(repo), "remote_url": remote_url})
+        results.append(repo_info.to_dict())
 
-        count += 1
-
-    # Save results to JSON
+    # Save results
+    input_config = {
+        "user_filter": user,
+        "follow_symlinks": follow_symlinks,
+        "verbose": verbose,
+        "sort_by_size": sort_by_size,
+    }
     target_dir = Path(base_dir).resolve()
-    json_path = save_results_to_json(results, target_dir, user)
+    json_path = save_results_to_json(results, target_dir, input_config, output_path)
 
-    # Show summary
+    # Summary
+    count = len(repos)
     if user:
         if count > 0:
             console.print(
-                f"\n[bold]Found [magenta]{count}[/magenta] git repositories matching '[yellow]{user}[/yellow]' in remote URL.[/bold]"
+                f"\n[bold]Found [magenta]{count}[/magenta] git repositories "
+                f"matching '[yellow]{user}[/yellow]' in remote URL.[/bold]"
             )
         else:
             console.print(
-                f"\n[bold yellow]No repositories found with '{user}' in remote URL. Try --verbose to debug.[/bold yellow]"
+                f"\n[bold yellow]No repositories found with '{user}' in remote URL. "
+                f"Try --verbose to debug.[/bold yellow]"
             )
     else:
         console.print(
-            f"\n[bold]Found [magenta]{count}[/magenta] git repositories.[/bold]"
+            f"\n[bold]Found [magenta]{count}[/magenta] git repositories "
+            f"with remote URLs.[/bold]"
         )
 
-    # Show saved file location with clickable link
     console.print(f"[bold green]Results saved to:[/bold green] {linkify(json_path)}")
-
     logger.info(f"Displayed {count} repositories")
 
 
 def _highlight_user_in_url(url: str, user: str) -> str:
     """
     Highlight the user/organization part in the remote URL using Rich markup.
-
     Args:
         url: Remote URL string
         user: Username/organization to highlight
-
     Returns:
         Rich-formatted string with highlighted user
     """
-    # Pattern to match user/organization in different URL formats
     patterns = [
         (
             rf"/({re.escape(user)})/",
             r"/\[yellow bold\]\1\[/yellow bold\]/",
-        ),  # https://github.com/user/repo
+        ),
         (
             rf":({re.escape(user)})/",
             r":\[yellow bold\]\1\[/yellow bold\]/",
-        ),  # git@github.com:user/repo
+        ),
     ]
-
     highlighted_url = url
     for pattern, replacement in patterns:
         if re.search(pattern, highlighted_url, re.IGNORECASE):
@@ -477,24 +504,22 @@ def _highlight_user_in_url(url: str, user: str) -> str:
                 pattern, replacement, highlighted_url, flags=re.IGNORECASE
             )
             break
-
     return highlighted_url
 
 
 if __name__ == "__main__":
     try:
         args = get_args()
-
         logger.info("Starting git repository finder")
         logger.debug(f"Configuration: {vars(args)}")
-
         print_git_repositories(
             args.directory,
             follow_symlinks=args.follow_symlinks,
             user=args.user,
             verbose=args.verbose,
+            sort_by_size=args.sort_by_size,
+            output_path=args.out,
         )
-
     except NotADirectoryError as e:
         console.print(f"[red]Error:[/red] {e}")
         logger.error(f"Directory error: {e}")
