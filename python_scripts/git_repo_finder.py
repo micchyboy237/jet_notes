@@ -334,47 +334,6 @@ def find_git_repositories(
         )
 
 
-def save_results_to_json(
-    results: list[dict],
-    target_dir: Path,
-    input_config: dict[str, str | bool | None],
-    output_path: Path | None = None,
-) -> Path:
-    """
-    Save repository results to a JSON file in the target directory.
-    Overwrites the same file unless custom output path is provided.
-    Args:
-        results: List of repository info dictionaries
-        target_dir: Directory to save the JSON file
-        input_config: Dictionary containing input configuration (user_filter, etc.)
-        output_path: Optional custom output file path
-    Returns:
-        Path to the saved JSON file
-    """
-    if output_path:
-        json_path = output_path.resolve()
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        json_filename = "_git_repos_results.json"
-        json_path = target_dir / json_filename
-
-    json_data = {
-        "search_directory": str(target_dir),
-        "input": input_config,
-        "timestamp": datetime.now().isoformat(),
-        "total_repositories": len(results),
-        "repositories": results,
-    }
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"Results saved to: {json_path}")
-        return json_path
-    except Exception as e:
-        logger.error(f"Failed to save JSON file: {e}")
-        raise
-
-
 def print_git_repositories(
     base_dir: str | Path,
     follow_symlinks: bool = False,
@@ -507,18 +466,81 @@ def _highlight_user_in_url(url: str, user: str) -> str:
     return highlighted_url
 
 
+def save_results_to_json(
+    results: list[dict],
+    target_dir: Path,
+    input_config: dict[str, str | bool | None],
+    output_path: Path | None = None,
+) -> Path:
+    """
+    Save repository results to a JSON file.
+
+    Args:
+        results: List of repository info dictionaries
+        target_dir: Directory to save the JSON file (used as fallback)
+        input_config: Dictionary containing input configuration (user_filter, etc.)
+        output_path: Optional custom output path. If a directory, saves
+                     _git_repo_finder_results.json inside it. If a file, saves directly.
+    Returns:
+        Path to the saved JSON file
+    """
+    if output_path:
+        resolved = output_path.resolve()
+        if resolved.is_dir() or output_path.suffix == "":
+            # Treat as directory - save with default filename inside it
+            json_path = resolved / "_git_repo_finder_results.json"
+        else:
+            # Treat as file path
+            json_path = resolved
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        json_filename = "_git_repo_finder_results.json"
+        json_path = target_dir / json_filename
+
+    json_data = {
+        "search_directory": str(target_dir),
+        "input": input_config,
+        "timestamp": datetime.now().isoformat(),
+        "total_repositories": len(results),
+        "repositories": results,
+    }
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Results saved to: {json_path}")
+        return json_path
+    except Exception as e:
+        logger.error(f"Failed to save JSON file: {e}")
+        raise
+
+
 if __name__ == "__main__":
     try:
         args = get_args()
         logger.info("Starting git repository finder")
         logger.debug(f"Configuration: {vars(args)}")
+
+        # Resolve target directory
+        target_dir = Path(args.directory).expanduser().resolve()
+
+        # Resolve output path with directory/file detection
+        output_path = None
+        if args.out is not None:
+            out = args.out.expanduser().resolve()
+            if out.is_dir() or args.out.suffix == "":
+                # Treat as directory
+                output_path = out / "_git_repo_finder_results.json"
+            else:
+                # Treat as file
+                output_path = out
+
         print_git_repositories(
             args.directory,
             follow_symlinks=args.follow_symlinks,
             user=args.user,
             verbose=args.verbose,
             sort_by_size=args.sort_by_size,
-            output_path=args.out,
+            output_path=output_path,
         )
     except NotADirectoryError as e:
         console.print(f"[red]Error:[/red] {e}")

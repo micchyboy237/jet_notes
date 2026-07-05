@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -64,29 +64,28 @@ def run_git_pull(
         return "error", f"Exception: {exc.__class__.__name__}: {exc}"
 
 
-def _write_progress(out_path: Path, data: dict[str, dict[str, str]]) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp_path.replace(out_path)
+def _write_state_file(state_path: Path, state: dict) -> None:
+    """Atomically write the complete state to a single JSON file."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp_path.replace(state_path)
 
 
-def _write_grouped_results(out_path: Path, grouped: dict[str, list[str]]) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(grouped, indent=2, sort_keys=True))
-    tmp_path.replace(out_path)
-
-
-def _write_failed_json(out_path: Path, failed: list[dict[str, str]]) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(failed, indent=2))
-    tmp_path.replace(out_path)
-
-
-def _write_summary(summary_path: Path, stats: dict[str, int], total: int) -> None:
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
+def _build_state(
+    progress_data: dict[str, dict[str, str]],
+    grouped_results: dict[str, list[str]],
+    failed_entries: list[dict[str, str]],
+    skipped_no_remote: list[str],
+    stats: dict[str, int],
+    total: int,
+    target_dir: str,
+    depth: int | None,
+    sort_by_size: str | None,
+    completed: bool = False,
+) -> dict:
+    """Build the complete state dictionary for the single state file."""
+    # Calculate summary percentages
     summary: dict[str, dict[str, float]] = {}
     for status, count in stats.items():
         percentage = (count / total * 100) if total > 0 else 0.0
@@ -94,9 +93,23 @@ def _write_summary(summary_path: Path, stats: dict[str, int], total: int) -> Non
             "count": count,
             "percentage": round(percentage, 1),
         }
-    tmp_path = summary_path.with_suffix(summary_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-    tmp_path.replace(summary_path)
+
+    return {
+        "metadata": {
+            "target_directory": target_dir,
+            "depth": depth,
+            "sort_by_size": sort_by_size,
+            "timestamp": datetime.now().isoformat(),
+            "completed": completed,
+            "total_repositories": total,
+            "processed_count": len(progress_data),
+        },
+        "summary": summary,
+        "grouped_results": grouped_results,
+        "failed": failed_entries,
+        "skipped_no_remote": skipped_no_remote,
+        "progress": progress_data,
+    }
 
 
 def git_pull_all_repos(
@@ -112,10 +125,23 @@ def git_pull_all_repos(
     By default, pulls are shallow (--depth 1), fetching only the latest
     changes instead of full history. Pass depth=None for a full pull.
 
-    This is now a thin wrapper around find_git_repositories that handles
-    pull execution and progress display.
+    All progress and results are saved to a single state file.
+
+    Args:
+        target_dir: Root directory to search for git repositories
+        out_path: Full path to the state JSON file (file, not directory)
+        depth: Shallow clone depth (None for full history)
+        sort_by_size: Sort repos by .git size before pulling ("asc" or "desc")
     """
     base_path = Path(target_dir).expanduser().resolve()
+    target_dir_str = str(base_path)
+
+    # Use provided out_path or default to target directory
+    if out_path is None:
+        state_path = base_path / "_git_pull_all_repos_state.json"
+    else:
+        state_path = out_path.expanduser().resolve()
+
     mode_line = (
         f"[bold yellow]Shallow mode enabled: depth={depth}[/bold yellow]"
         if depth is not None
@@ -125,14 +151,15 @@ def git_pull_all_repos(
         f"[bold cyan]Scanning for git repositories in:[/bold cyan] {base_path}\n"
         f"{mode_line}\n"
     )
+    console.print(f"[dim]State file: {state_path}[/dim]\n")
 
     # Use enhanced find_git_repositories with all needed info
     repos: list[RepoInfo] = list(
         find_git_repositories(
             base_path,
             sort_by_size=sort_by_size,
-            include_size=sort_by_size is not None,  # Only get size if sorting
-            check_remote_tracking=True,  # We need this to skip repos without upstream
+            include_size=sort_by_size is not None,
+            check_remote_tracking=True,
         )
     )
 
@@ -156,8 +183,20 @@ def git_pull_all_repos(
 
     if total == 0:
         console.print("[yellow]No git repositories found.[/yellow]")
-        if out_path:
-            _write_progress(out_path, progress_data)
+        state = _build_state(
+            progress_data=progress_data,
+            grouped_results=grouped_results,
+            failed_entries=failed_entries,
+            skipped_no_remote=skipped_no_remote,
+            stats={"success": 0, "up-to-date": 0, "failed": 0, "error": 0},
+            total=0,
+            target_dir=target_dir_str,
+            depth=depth,
+            sort_by_size=sort_by_size,
+            completed=True,
+        )
+        _write_state_file(state_path, state)
+        console.print(f"[dim]State saved to: {state_path}[/dim]")
         return
 
     console.print(
@@ -171,6 +210,22 @@ def git_pull_all_repos(
         "failed": 0,
         "error": 0,
     }
+
+    def save_state(completed: bool = False) -> None:
+        """Save complete state to single JSON file."""
+        state = _build_state(
+            progress_data=progress_data,
+            grouped_results=grouped_results,
+            failed_entries=failed_entries,
+            skipped_no_remote=skipped_no_remote,
+            stats=stats,
+            total=total,
+            target_dir=target_dir_str,
+            depth=depth,
+            sort_by_size=sort_by_size,
+            completed=completed,
+        )
+        _write_state_file(state_path, state)
 
     with Progress(
         SpinnerColumn(),
@@ -195,6 +250,11 @@ def git_pull_all_repos(
                     f"[dim]Skipped (no remote tracking)[/dim]"
                 )
                 skipped_no_remote.append(str(repo))
+                progress_data[str(repo)] = {
+                    "status": "skipped",
+                    "message": "No remote tracking configured",
+                }
+                save_state()
                 progress.advance(task)
                 continue
 
@@ -209,10 +269,8 @@ def git_pull_all_repos(
             if status in ("failed", "error"):
                 failed_entries.append({"repoPath": str(repo), "message": message})
 
-            if out_path:
-                _write_progress(out_path, progress_data)
-                failed_path = out_path.parent / "failed.json"
-                _write_failed_json(failed_path, failed_entries)
+            # Save state immediately after each repo
+            save_state()
 
             icon = {
                 "success": "[green]✓[/green]",
@@ -226,6 +284,9 @@ def git_pull_all_repos(
                 f"[dim]{message[:120]}{'...' if len(message) > 120 else ''}[/dim]"
             )
             progress.advance(task)
+
+    # Write final completed state
+    save_state(completed=True)
 
     # Display skipped repos
     if skipped_no_remote:
@@ -264,25 +325,14 @@ def git_pull_all_repos(
         console.print("\n")
         console.print(table)
 
-        if out_path:
-            _write_grouped_results(out_path, grouped_results)
-            summary_path = out_path.parent / "summary.json"
-            _write_summary(summary_path, stats, total)
-            failed_path = out_path.parent / "failed.json"
-            _write_failed_json(failed_path, failed_entries)
-            console.print(
-                f"\n[bold]Completed processing {total} repositories.[/bold]\n"
-                f"Results saved to: [link=file://{out_path}]{out_path}[/link]\n"
-                f"Summary saved to: [link=file://{summary_path}]{summary_path}[/link]\n"
-                f"Failed saved to:  [link=file://{failed_path}]{failed_path}[/link]"
-            )
-        else:
-            console.print(f"\n[bold]Completed processing {total} repositories.[/bold]")
+        console.print(
+            f"\n[bold]Completed processing {total} repositories.[/bold]\n"
+            f"[bold green]State saved to:[/bold green] "
+            f"[link=file://{state_path}]{state_path}[/link]"
+        )
 
 
 def main():
-    OUTPUT_DIR = Path(__file__).parent / "generated" / Path(__file__).stem
-    shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
     parser = argparse.ArgumentParser(
         description="Recursively pull all Git repositories under a directory."
     )
@@ -297,7 +347,10 @@ def main():
         "--out",
         dest="out",
         type=Path,
-        help="Save progress status to JSON file",
+        help="Save state to JSON file or directory. "
+        "If a directory, saves _git_pull_all_repos_state.json inside it. "
+        "If a file path, saves directly to that file. "
+        "(default: _git_pull_all_repos_state.json in target directory)",
     )
     parser.add_argument(
         "-n",
@@ -320,21 +373,31 @@ def main():
         "(asc: smallest first, desc: largest first)",
     )
     args = parser.parse_args()
+
+    # Resolve target directory
+    target_dir = Path(args.target_dir).expanduser().resolve()
+
+    # Determine output path
     if args.out is not None:
         out_path = args.out.expanduser().resolve()
+        if out_path.is_dir() or args.out.suffix == "":
+            # Treat as directory
+            out_path = out_path / "_git_pull_all_repos_state.json"
     else:
-        out_path = (OUTPUT_DIR / "results.json").resolve()
+        # Default: save in target directory
+        out_path = target_dir / "_git_pull_all_repos_state.json"
+
     depth = None if args.no_depth else DEFAULT_DEPTH
+
     console.print(
-        f"[bold]Target directory:[/bold] [link=file://{Path(args.target_dir).expanduser().resolve()}]{args.target_dir}[/link]"
+        f"[bold]Target directory:[/bold] [link=file://{target_dir}]{target_dir}[/link]"
     )
-    console.print(
-        f"[bold]Output path:[/bold] [link=file://{out_path}]{out_path}[/link]"
-    )
+    console.print(f"[bold]State file:[/bold] [link=file://{out_path}]{out_path}[/link]")
     console.print(
         "[bold]Pull mode:[/bold] "
         + (f"shallow (depth={depth})" if depth is not None else "full history")
     )
+
     git_pull_all_repos(
         args.target_dir,
         out_path=out_path,
