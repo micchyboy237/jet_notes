@@ -21,7 +21,7 @@ def find_git_repos(base_dir: str) -> list[str]:
     for root, dirs, _ in os.walk(base_dir):
         if ".git" in dirs:
             repos.append(root)
-            dirs[:] = []  # don’t descend further once repo is found
+            dirs[:] = []  # don't descend further once repo is found
     return repos
 
 
@@ -384,9 +384,7 @@ def process_file_mode(
     )
     updates = filter_and_sort_results(raw_results, since=since, sort_by=sort_by)
     base_output_file = os.path.join(base_dir, "_file_stats.json")
-    output_file = (
-        output_file or base_output_file
-    )  # REMOVED: generate_unique_output_filename call
+    output_file = output_file or base_output_file
     print("\nTop 10 most recent/relevant items:")
     for item in updates[:10]:
         print(
@@ -418,9 +416,7 @@ def process_repo(
         repo_dir,
         "_git_stats.json" if is_git_repo and mode != "file" else "_file_stats.json",
     )
-    output_file = (
-        output_file or base_output_file
-    )  # REMOVED: generate_unique_output_filename call
+    output_file = output_file or base_output_file
     for item in updates:
         if "path" in item:
             item["path"] = os.path.abspath(item["path"])
@@ -428,9 +424,8 @@ def process_repo(
     return updates
 
 
-def process_combined(
+def process_single(
     base_dir,
-    repos,
     extensions,
     depth,
     mode,
@@ -440,32 +435,18 @@ def process_combined(
     since,
     sort_by,
 ):
-    combined = []
-    base_combined_file = os.path.join(base_dir, "_combined_stats.json")
-    combined_file = (
-        output_file or base_combined_file
-    )  # REMOVED: _stats_results folder reference
-    for repo_dir in repos:
-        print(f"\n=== Scanning repo: {repo_dir} ===")
-        updates = process_repo(
-            repo_dir,
-            extensions,
-            depth,
-            mode,
-            type_filter,
-            file_pattern,
-            None,
-            since,
-            sort_by,
-        )
-        combined.extend(updates)
-    combined = filter_and_sort_results(combined, since=since, sort_by=sort_by)
-    for item in combined:
-        if "path" in item:
-            item["path"] = os.path.abspath(item["path"])
-    save_file(combined, combined_file)
-    save_file(combined, base_combined_file)
-    print(f"\nCombined stats saved to: {base_combined_file}")
+    print(f"\n=== Scanning: {base_dir} ===")
+    updates = process_repo(
+        base_dir,
+        extensions,
+        depth,
+        mode,
+        type_filter,
+        file_pattern,
+        output_file,
+        since,
+        sort_by,
+    )
 
 
 if __name__ == "__main__":
@@ -535,20 +516,21 @@ if __name__ == "__main__":
     else:
         repos = find_git_repos(base_dir)
         if repos:
-            process_combined(
-                base_dir,
-                repos,
-                extensions,
-                args.depth,
-                args.mode,
-                args.type,
-                args.file_pattern,
-                args.output_file,
-                args.since,
-                args.sort,
-            )
+            # Process each repo individually without combining
+            for repo_dir in repos:
+                process_single(
+                    repo_dir,
+                    extensions,
+                    args.depth,
+                    args.mode,
+                    args.type,
+                    args.file_pattern,
+                    args.output_file,
+                    args.since,
+                    args.sort,
+                )
         else:
-            process_repo(
+            process_single(
                 base_dir,
                 extensions,
                 args.depth,

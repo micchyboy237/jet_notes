@@ -72,20 +72,81 @@ llama-server \
 
 # https://huggingface.co/Qwen/Qwen3.5-2B
 llama-server \
-  -m model.gguf \
-  -ngl 20 \
-  -c 4096 \
-  -b 256 \
-  -ub 128 \
+  -m ~/.cache/llama.cpp/llm_models/Qwen3.5-2B-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 12288 \
+  -b 512 \
+  -ub 256 \
   --flash-attn on \
-  --cache-type-k q4_0 \
-  --cache-type-v q4_0 \
   --cont-batching \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --cache-prompt \
+  --mlock \
+  --no-mmap \
+  --jinja \
   --host 0.0.0.0 \
   --port 8080
 
 
+# https://huggingface.co/HauhauCS/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive
+# -c 12288 \   # ← Good starting point for 16GB / safe for 8GB
+# -b 512 \     # Smaller batch on M1
+# --mlock \    # Important on Apple Silicon
+llama-server \
+  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/nsfw/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" \
+  -ngl 99 \
+  -c 12288 \
+  -b 512 \
+  -ub 256 \
+  --flash-attn on \
+  --cont-batching \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --cache-prompt \
+  --mlock \
+  --no-mmap \
+  --jinja \
+  --host 0.0.0.0 \
+  --port 8080
+
+llama-server \
+  -m ~/.cache/llama.cpp/llm_models/nsfw/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -c 16384 \
+  --n-gpu-layers 99 \
+  --flash-attn on \
+  -b 1024 \
+  -ub 512 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 4 \
+  --threads-batch 4 \
+  --cont-batching \
+  --jinja \
+  --reasoning auto \
+  -np 1
+
+
 # https://huggingface.co/Qwen/Qwen3.5-0.8B
+llama-server \
+  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/Qwen3.5-0.8B-Q4_K_M.gguf" \
+  -ngl all \
+  -c 12288 \
+  -b 1024 \
+  -ub 512 \
+  --flash-attn on \
+  --cont-batching \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --cache-prompt \
+  --mlock \
+  --no-mmap \
+  --jinja \
+  --host 0.0.0.0 \
+  --port 8080
+
 llama-server \
   -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/Qwen3.5-0.8B-Q4_K_M.gguf" \
   -ngl all \
@@ -118,22 +179,7 @@ llama-server \
 
 
 # https://huggingface.co/HauhauCS/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive
-llama-server \
-  -m "/Users/jethroestrada/.cache/llama.cpp/llm_models/nsfw/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" \
-  -ngl 99 \
-  -c 8192 \
-  -b 1024 \
-  -ub 512 \
-  --flash-attn on \
-  --cont-batching \
-  --cache-type-k q8_0 \
-  --cache-type-v q8_0 \
-  --cache-prompt \
-  --mlock \
-  --no-mmap \
-  --jinja \
-  --host 0.0.0.0 \
-  --port 8080
+
 
 
 # https://huggingface.co/mradermacher/Gemma3-UNCENSORED-1B-GGUF
