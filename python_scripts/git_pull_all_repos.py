@@ -28,18 +28,60 @@ def run_git_pull(
     repo_path: Path,
     depth: int | None = DEFAULT_DEPTH,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str]:
-    """Execute git pull with automatic fast-forward/force-push recovery."""
+    """Execute git pull with automatic fast-forward/force-push recovery.
+
+    Handles stale .git lock files by removing them and retrying once.
+    """
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if depth is not None:
         fetch_cmd.extend(["--depth", str(depth)])
 
-    try:
-        subprocess.run(
-            fetch_cmd, capture_output=True, text=True, timeout=120, check=True
-        )
-    except subprocess.CalledProcessError as e:
-        return "failed", f"Fetch failed: {e.stderr.strip()}"
+    max_retries = 1  # One retry after lock cleanup
+    for attempt in range(max_retries + 1):
+        try:
+            subprocess.run(
+                fetch_cmd, capture_output=True, text=True, timeout=120, check=True
+            )
+            break  # Success, exit retry loop
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.strip()
 
+            # Check if this is a lock file error
+            if "Unable to create" in stderr and ".git/shallow.lock" in stderr:
+                lock_path = repo_path / ".git" / "shallow.lock"
+                console.print(
+                    f" [yellow]⚠[/yellow] [dim]Lock file detected: {lock_path}[/dim]"
+                )
+
+                if lock_path.exists():
+                    try:
+                        lock_path.unlink()
+                        console.print(
+                            f" [green]✓[/green] [dim]Removed stale lock file[/dim]"
+                        )
+                    except OSError as unlink_error:
+                        console.print(
+                            f" [red]✗[/red] [dim]Failed to remove lock: {unlink_error}[/dim]"
+                        )
+                        return "failed", f"Fetch failed: {stderr}"
+                else:
+                    console.print(
+                        f" [yellow]⚠[/yellow] [dim]Lock file not found on disk, "
+                        f"another process may be running[/dim]"
+                    )
+                    return "failed", f"Fetch failed: {stderr}"
+
+                # Retry the fetch after removing lock
+                if attempt < max_retries:
+                    console.print(f" [dim]Retrying fetch...[/dim]")
+                    continue
+                else:
+                    return "failed", f"Fetch failed after lock cleanup: {stderr}"
+
+            # Not a lock error, fail immediately
+            return "failed", f"Fetch failed: {stderr}"
+
+    # Determine current branch
     try:
         branch = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
@@ -51,6 +93,7 @@ def run_git_pull(
     except Exception:
         return "failed", "Could not determine current branch"
 
+    # Try fast-forward merge
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "merge", "--ff-only", f"origin/{branch}"],
@@ -112,7 +155,6 @@ def _build_state(
     previous_state: dict | None = None,
 ) -> dict:
     """Build the complete state dictionary with proper merging for continue/only-failed."""
-    # Merge stats from previous state when continuing
     final_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
@@ -135,7 +177,6 @@ def _build_state(
             "percentage": percentage,
         }
 
-    # Merge grouped results
     final_grouped: dict[str, list[str]] = {
         "success": [],
         "up-to-date": [],
@@ -148,22 +189,25 @@ def _build_state(
     for k in grouped_results:
         final_grouped[k].extend(grouped_results[k])
 
-    # Merge failed entries (remove ones that succeeded on retry)
+    # --- FIXED: Remove duplicate failed entries by repoPath ---
     final_failed = []
     if previous_state:
-        prev_failed_paths = {
-            entry["repoPath"] for entry in previous_state.get("failed", [])
-        }
+        # Build set of repoPaths that failed in the CURRENT run
         current_failed_paths = {entry["repoPath"] for entry in failed_entries}
+        # Keep previous failed entries ONLY if they are NOT being updated in current run
         final_failed = [
             entry
             for entry in previous_state.get("failed", [])
             if entry["repoPath"] not in current_failed_paths
-            or entry["repoPath"] in current_failed_paths
         ]
+        console.print(
+            f"[dim]State merge: keeping {len(final_failed)} previous failed entries, "
+            f"replacing {len(current_failed_paths)} with current results[/dim]"
+        )
+    # Append current run's failed entries (these replace old ones for same repoPath)
     final_failed.extend(failed_entries)
+    # --- END FIX ---
 
-    # Skipped
     final_skipped = skipped_no_remote[:]
     if previous_state:
         final_skipped = previous_state.get("skipped_no_remote", []) + final_skipped
@@ -185,6 +229,17 @@ def _build_state(
         "processed_repos": sorted(list(processed_repos)),
         "progress": progress_data,
     }
+
+
+def _status_label(status: str) -> str:
+    """Return Rich-formatted label for a status string."""
+    labels = {
+        "success": "[green]✓ Success[/green]",
+        "up-to-date": "[blue]→ Up to date[/blue]",
+        "failed": "[red]✗ Failed[/red]",
+        "error": "[red bold]! Error[/red bold]",
+    }
+    return labels.get(status, status)
 
 
 def git_pull_all_repos(
@@ -400,7 +455,14 @@ def git_pull_all_repos(
 
     save_state(completed=True)
 
-    # Skipped summary
+    merged_stats = dict(stats)
+    if previous_state:
+        prev_summary = previous_state.get("summary", {})
+        for status in ["success", "up-to-date", "failed", "error"]:
+            merged_stats[status] = merged_stats.get(status, 0) + prev_summary.get(
+                status, {}
+            ).get("count", 0)
+
     if skipped_no_remote:
         console.print(
             f"\n[yellow]Skipped {len(skipped_no_remote)} repositories "
@@ -409,10 +471,12 @@ def git_pull_all_repos(
         for repo_path in skipped_no_remote:
             console.print(f" • {repo_path}")
 
-    # Final Pull Summary Table
     if total_this_run > 0:
+        # --- Show THIS RUN's summary ---
         table = Table(
-            title="Pull Summary", show_header=True, header_style="bold magenta"
+            title="Pull Summary (This Run)",
+            show_header=True,
+            header_style="bold magenta",
         )
         table.add_column("Status", style="bold")
         table.add_column("Count", justify="right")
@@ -420,25 +484,14 @@ def git_pull_all_repos(
 
         status_order = ["success", "up-to-date", "failed", "error"]
         for status in status_order:
-            count = (
-                stats.get(status, 0)
-                if not previous_state
-                else final_stats.get(status, 0)
-            )  # use merged if available
-            perc = (count / grand_total * 100) if grand_total > 0 else 0
-            label = (
-                "[green]Success[/green]"
-                if status == "success"
-                else "[blue]Up to date[/blue]"
-                if status == "up-to-date"
-                else "[red]Failed[/red]"
-                if status == "failed"
-                else "[red bold]Error[/red bold]"
-            )
+            count = stats.get(status, 0)
+            perc = (count / total_this_run * 100) if total_this_run > 0 else 0
+            label = _status_label(status)
             table.add_row(label, str(count), f"{perc:5.1f}%")
 
         console.print("\n")
         console.print(table)
+
         console.print(
             f"\n[bold]Completed processing {total_this_run} repositories this run.[/bold]\n"
             f"[bold green]State saved to:[/bold green] "
