@@ -1,6 +1,6 @@
-import json
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -83,30 +83,68 @@ def check_health_scutil():
 
 
 def check_speed_live():
-    """Run networkQuality and log the raw JSON."""
+    """Stream networkQuality -s in real-time and parse plain text summary."""
     log.info("Running live speed test...")
-    output = run_cmd("networkQuality -s", timeout=20)
 
-    if not output:
-        log.warning("Speed test returned no data.")
-        return
-
+    cmd = "networkQuality -s"
     try:
-        data = json.loads(output)
-        dl = data.get("download_capacity", "N/A")
-        ul = data.get("upload_capacity", "N/A")
-        resp = data.get("responsiveness", "N/A")
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
-        table = Table(title="Live Speed Test")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
-        table.add_row("Download", f"{dl} Mbps")
-        table.add_row("Upload", f"{ul} Mbps")
-        table.add_row("Responsiveness", resp)
-        console.print(table)
-        log.info(f"Speed Results: DL={dl}, UL={ul}, Resp={resp}")
-    except json.JSONDecodeError:
-        log.error(f"Failed to parse speed test JSON: {output}")
+        last_line = ""
+        # Read character-by-character or line chunks to handle \r live updates
+        buffer = ""
+        while True:
+            char = process.stdout.read(1)
+            if not char and process.poll() is not None:
+                break
+            if char in ("\r", "\n"):
+                if buffer.strip():
+                    last_line = buffer.strip()
+                    # Print live updating line to stdout
+                    print(f"\r{last_line}", end="", flush=True)
+                buffer = ""
+            else:
+                buffer += char
+
+        process.wait(timeout=5)
+        print()  # Clear line ending after loop
+
+        if not last_line:
+            log.warning("Speed test returned no data.")
+            return
+
+        # Parse text format: Downlink: X Mbps, Y RPM - Uplink: Z Mbps, W RPM
+        pattern = r"Downlink:\s*([\d\.]+)\s*Mbps,\s*([\d]+)\s*RPM\s*-\s*Uplink:\s*([\d\.]+)\s*Mbps,\s*([\d]+)\s*RPM"
+        match = re.search(pattern, last_line)
+
+        if match:
+            dl, dl_rpm, ul, ul_rpm = match.groups()
+
+            table = Table(title="Live Speed Test Results")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", style="green")
+            table.add_row("Download", f"{dl} Mbps ({dl_rpm} RPM)")
+            table.add_row("Upload", f"{ul} Mbps ({ul_rpm} RPM)")
+            console.print(table)
+
+            log.info(
+                f"Speed Results: DL={dl} Mbps, UL={ul} Mbps, DL_RPM={dl_rpm}, UL_RPM={ul_rpm}"
+            )
+        else:
+            log.warning(f"Could not parse live output line: '{last_line}'")
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+        log.error("Speed test timed out.")
+    except Exception as e:
+        log.error(f"Failed to run live speed test: {e}")
 
 
 def apply_fix(issue_type):

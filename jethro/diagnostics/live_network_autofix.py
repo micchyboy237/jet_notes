@@ -27,3 +27,7 @@ def diagnose_and_fix():
         subprocess.run(["sudo", "dscacheutil", "-flushcache"])
         subprocess.run(["sudo", "killall", "-HUP", "mDNSResponder"])
         return {"status": "repaired", "action": "dns_flush"}
+
+
+if __name__ == "__main__":
+    diagnose_and_fix()
