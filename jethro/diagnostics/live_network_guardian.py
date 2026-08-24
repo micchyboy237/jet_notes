@@ -21,8 +21,8 @@ from rich.table import Table
 INTERFACE = "en1"
 CHECK_IP = "8.8.8.8"
 CHECK_INTERVAL = 5  # How often to run health check (seconds)
-SPEED_CHECK_INTERVAL = 120  # Speed test every 2 minutes
-COOLDOWN_PERIOD = 20  # Wait after applying a fix before re-checking
+SPEED_CHECK_INTERVAL = 15  # Speed test every 15 seconds
+COOLDOWN_PERIOD = 5  # Wait after applying a fix before re-checking
 MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
 DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
