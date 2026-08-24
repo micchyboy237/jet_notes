@@ -26,6 +26,8 @@ SPEED_CHECK_INTERVAL = 15  # Speed test every 15 seconds
 COOLDOWN_PERIOD = 15  # Wait after applying a fix before re-checking
 MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
 DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
+INTERFACE_RECOVERY_TIMEOUT = 15
+
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
 
@@ -303,20 +305,22 @@ def apply_fix(issue_type):
         time.sleep(5)
         return False  # Signal: re-check health, don't count as hardware fix attempt
 
-    elif issue_type == "Interface Missing":
+    elif issue_type in ("Interface Missing", "Speed Degraded"):
         log.info(f"Cycling power on {INTERFACE}...")
         run_cmd(f"networksetup -setairportpower {INTERFACE} off", timeout=10)
         time.sleep(3)
         run_cmd(f"networksetup -setairportpower {INTERFACE} on", timeout=10)
 
         # Verify recovery before returning
-        for i in range(15):
+        for i in range(INTERFACE_RECOVERY_TIMEOUT):
             time.sleep(1)
             nwi = run_cmd("scutil --nwi", timeout=3)
             if f"{INTERFACE} :" in nwi:
                 log.info(f"Interface {INTERFACE} recovered after {i + 1}s")
                 return True
-        log.error(f"Power cycle failed to restore {INTERFACE} after 15s")
+        log.error(
+            f"Power cycle failed to restore {INTERFACE} after {INTERFACE_RECOVERY_TIMEOUT}s"
+        )
         return False
 
     elif issue_type == "Not Reachable":
@@ -324,16 +328,16 @@ def apply_fix(issue_type):
         run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
         return True
 
-    elif issue_type == "DNS Missing":
+    elif issue_type in "DNS Missing":
         log.info("Flushing DNS cache and restarting mDNSResponder...")
         run_cmd("dscacheutil -flushcache", timeout=5)
         run_cmd("killall -HUP mDNSResponder", timeout=5)
         return True
 
-    elif issue_type == "Speed Degraded":
-        log.info("Speed degraded; renewing DHCP as lightweight first step...")
-        run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
-        return True
+    # elif issue_type == "Speed Degraded":
+    #     log.info("Speed degraded; renewing DHCP as lightweight first step...")
+    #     run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
+    #     return True
 
     else:
         log.error(f"No fix defined for issue type: {issue_type}")
