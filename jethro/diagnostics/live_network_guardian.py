@@ -38,7 +38,7 @@ SPEED_TEST_BYTES_DEGRADED = 2_000_000  # 2MB for degraded connections (adaptive)
 SPEED_DEGRADED_THRESHOLD = 0.1  # Mbps threshold to trigger degraded mode + fix
 SPEED_TEST_PROGRESS_INTERVAL = 0.5
 SPEED_TEST_URL_TEMPLATE = "https://speed.cloudflare.com/__down?bytes={}"
-SPEED_ROLLING_WINDOW = 5  # Number of recent speed samples to average
+SPEED_ROLLING_WINDOW = 3  # Number of recent speed samples to average
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
