@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Mac Network Monitor - With Speed Test
+# Mac Network Monitor - With Speed Test (FIXED)
 # Usage: ./network-monitor.sh
 # =============================================================================
 
@@ -23,8 +23,8 @@ if [ -z "$WIFI_DEVICE" ]; then
 fi
 
 # Speed test configuration
-SPEED_TEST_URL="http://speedtest.tele2.net/1MB.zip"  # Reliable 1MB test file
-SPEED_TEST_TIMEOUT=10  # seconds
+SPEED_TEST_URL="http://speedtest.tele2.net/1MB.zip"
+SPEED_TEST_TIMEOUT=15
 
 echo -e "${YELLOW}Network Monitor - Press Ctrl+C to stop${NC}"
 echo -e "${CYAN}Device: $WIFI_DEVICE | Service: $WIFI_SERVICE${NC}"
@@ -59,47 +59,47 @@ get_dns_servers() {
 categorize_speed() {
     local speed_mbps=$1
     
-    if (( $(echo "$speed_mbps < 1" | bc -l) )); then
-        echo "${RED}Very Slow (< 1 Mbps)"
-    elif (( $(echo "$speed_mbps < 5" | bc -l) )); then
-        echo "${YELLOW}Slow (1-5 Mbps)"
-    elif (( $(echo "$speed_mbps < 25" | bc -l) )); then
-        echo "${CYAN}Moderate (5-25 Mbps)"
-    elif (( $(echo "$speed_mbps < 100" | bc -l) )); then
-        echo "${GREEN}Fast (25-100 Mbps)"
-    elif (( $(echo "$speed_mbps < 500" | bc -l) )); then
-        echo "${GREEN}Very Fast (100-500 Mbps)"
-    else
-        echo "${MAGENTA}Ultra Fast (> 500 Mbps)"
-    fi
+    # Use awk for floating point comparison
+    local category=$(awk -v speed="$speed_mbps" 'BEGIN {
+        if (speed < 1) print "Very Slow (< 1 Mbps)|RED"
+        else if (speed < 5) print "Slow (1-5 Mbps)|YELLOW"
+        else if (speed < 25) print "Moderate (5-25 Mbps)|CYAN"
+        else if (speed < 100) print "Fast (25-100 Mbps)|GREEN"
+        else if (speed < 500) print "Very Fast (100-500 Mbps)|GREEN"
+        else print "Ultra Fast (> 500 Mbps)|MAGENTA"
+    }')
+    
+    echo "$category"
 }
 
 # Function to test download speed
 test_download_speed() {
     local url="$1"
-    local temp_file="/tmp/speedtest_$$"
+    local temp_file="/tmp/speedtest_$$.tmp"
     
-    # Download and measure time
-    local start_time=$(date +%s%N)
-    curl -L -o "$temp_file" --max-time $SPEED_TEST_TIMEOUT -s -w "%{size_download}" "$url" 2>/dev/null
-    local end_time=$(date +%s%N)
-    local bytes_downloaded=$(wc -c < "$temp_file" 2>/dev/null || echo "0")
+    # Use curl with built-in timing and size reporting
+    local curl_output=$(curl -L -o "$temp_file" --max-time $SPEED_TEST_TIMEOUT -s -w "SIZE:%{size_download}\nTIME:%{time_total}" "$url" 2>/dev/null)
+    
+    # Parse curl output
+    local bytes_downloaded=$(echo "$curl_output" | grep "SIZE:" | cut -d: -f2)
+    local time_taken=$(echo "$curl_output" | grep "TIME:" | cut -d: -f2)
     
     # Cleanup
     rm -f "$temp_file"
     
     # Calculate speed in Mbps
-    if [ "$bytes_downloaded" -gt 0 ] 2>/dev/null; then
-        local duration_ns=$((end_time - start_time))
-        local duration_s=$(echo "scale=3; $duration_ns / 1000000000" | bc -l)
-        
-        if (( $(echo "$duration_s > 0" | bc -l) )); then
-            local bits=$(echo "$bytes_downloaded * 8" | bc)
-            local speed_mbps=$(echo "scale=2; $bits / $duration_s / 1000000" | bc -l)
-            echo "$speed_mbps"
-        else
-            echo "0"
-        fi
+    if [ -n "$bytes_downloaded" ] && [ "$bytes_downloaded" -gt 0 ] 2>/dev/null && [ -n "$time_taken" ]; then
+        # Use awk for floating point math
+        local speed_mbps=$(awk -v bytes="$bytes_downloaded" -v time="$time_taken" 'BEGIN {
+            if (time > 0) {
+                bits = bytes * 8
+                mbps = bits / time / 1000000
+                printf "%.2f", mbps
+            } else {
+                print "0"
+            }
+        }')
+        echo "$speed_mbps"
     else
         echo "0"
     fi
@@ -107,9 +107,10 @@ test_download_speed() {
 
 # Track last speed test time
 LAST_SPEED_TEST=0
-SPEED_TEST_INTERVAL=30  # Test speed every 30 seconds
+SPEED_TEST_INTERVAL=30
 CACHED_SPEED="N/A"
 CACHED_CATEGORY=""
+CACHED_COLOR=""
 
 while true; do
     clear
@@ -202,20 +203,36 @@ while true; do
         
         if [ "$SPEED_MBPS" != "0" ] && [ -n "$SPEED_MBPS" ]; then
             CACHED_SPEED="$SPEED_MBPS"
-            CACHED_CATEGORY=$(categorize_speed "$SPEED_MBPS")
+            
+            # Get category and color
+            CATEGORY_RESULT=$(categorize_speed "$SPEED_MBPS")
+            CACHED_CATEGORY=$(echo "$CATEGORY_RESULT" | cut -d'|' -f1)
+            COLOR_NAME=$(echo "$CATEGORY_RESULT" | cut -d'|' -f2)
+            
+            # Set color variable based on name
+            case $COLOR_NAME in
+                RED) CACHED_COLOR="$RED" ;;
+                YELLOW) CACHED_COLOR="$YELLOW" ;;
+                CYAN) CACHED_COLOR="$CYAN" ;;
+                GREEN) CACHED_COLOR="$GREEN" ;;
+                MAGENTA) CACHED_COLOR="$MAGENTA" ;;
+                *) CACHED_COLOR="$WHITE" ;;
+            esac
+            
             LAST_SPEED_TEST=$CURRENT_TIME
             echo -e "Speed: ${WHITE}${SPEED_MBPS} Mbps${NC}"
-            echo -e "Category: $CACHED_CATEGORY${NC}"
+            echo -e "Category: ${CACHED_COLOR}${CACHED_CATEGORY}${NC}"
         else
             echo -e "Speed: ${YELLOW}Test failed or timed out${NC}"
             CACHED_SPEED="N/A"
             CACHED_CATEGORY=""
+            CACHED_COLOR=""
         fi
     else
         # Show cached results
-        if [ "$CACHED_SPEED" != "N/A" ]; then
+        if [ "$CACHED_SPEED" != "N/A" ] && [ -n "$CACHED_CATEGORY" ]; then
             echo -e "Speed: ${WHITE}${CACHED_SPEED} Mbps${NC}"
-            echo -e "Category: $CACHED_CATEGORY${NC}"
+            echo -e "Category: ${CACHED_COLOR}${CACHED_CATEGORY}${NC}"
         else
             echo -e "Speed: ${YELLOW}Waiting for next test...${NC}"
         fi
