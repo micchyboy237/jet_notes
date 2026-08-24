@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,9 @@ SPEED_DEGRADED_THRESHOLD = 0.1  # Mbps threshold to trigger degraded mode + fix
 SPEED_TEST_PROGRESS_INTERVAL = 0.5
 SPEED_TEST_URL_TEMPLATE = "https://speed.cloudflare.com/__down?bytes={}"
 SPEED_ROLLING_WINDOW = 3  # Number of recent speed samples to average
+# FIX: Minimum elapsed time threshold to consider a speed test valid (seconds).
+# Transfers completing faster than this are likely cached responses.
+SPEED_TEST_MIN_VALID_ELAPSED = 0.5
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -208,6 +212,7 @@ def check_speed_live():
     """
     Adaptive download speed test via curl with dual progress display.
     Uses smaller payload when rolling average indicates degradation.
+    Includes cache-busting and validation to prevent false 0.0 readings.
     """
     avg_speed = get_average_speed()
 
@@ -221,7 +226,9 @@ def check_speed_live():
     else:
         test_bytes = SPEED_TEST_BYTES_NORMAL
 
-    url = SPEED_TEST_URL_TEMPLATE.format(test_bytes)
+    # FIX: Add cache-busting parameter to prevent CDN/curl caching
+    nocache = random.randint(1, 999999)
+    url = SPEED_TEST_URL_TEMPLATE.format(test_bytes) + f"&nocache={nocache}"
     log.info(f"Running speed test ({test_bytes // 1_000_000}MB from Cloudflare)...")
 
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".speedtest")
@@ -229,6 +236,10 @@ def check_speed_live():
     tmp_file.close()
 
     stop_event = threading.Event()
+    mbps = 0.0
+    final_bytes = 0
+    elapsed_total = 0.0
+    test_valid = True
 
     try:
         with Progress(
@@ -254,6 +265,7 @@ def check_speed_live():
             log.debug("Speed watcher thread started")
 
             start_time = time.time()
+            # FIX: Added cache-control headers and --no-sessionid to prevent caching
             subprocess.run(
                 [
                     "curl",
@@ -262,12 +274,17 @@ def check_speed_live():
                     tmp_path,
                     "--max-time",
                     "15",
+                    "-H",
+                    "Cache-Control: no-cache, no-store, must-revalidate",
+                    "-H",
+                    "Pragma: no-cache",
+                    "--no-sessionid",
                     url,
                 ],
                 capture_output=False,
                 timeout=20,
             )
-            elapsed_total = max(time.time() - start_time, 0.1)
+            elapsed_total = max(time.time() - start_time, 0.001)
 
             stop_event.set()
             watcher.join(timeout=2)
@@ -276,29 +293,59 @@ def check_speed_live():
             )
 
         final_bytes = os.path.getsize(tmp_path)
-        mbps = round((final_bytes * 8) / (elapsed_total * 1_000_000), 3)
 
-        # Append result to rolling history
-        _speed_history.append(mbps)
-        log.debug(f"Speed history updated: {list(_speed_history)}")
+        # FIX: Validate the test result before recording
+        if final_bytes == 0:
+            log.warning(
+                "Speed test completed but temp file is empty (0 bytes). "
+                "Likely cached response or connection failure. Discarding sample."
+            )
+            test_valid = False
+        elif elapsed_total < SPEED_TEST_MIN_VALID_ELAPSED:
+            log.warning(
+                f"Suspiciously fast completion ({elapsed_total:.3f}s for "
+                f"{final_bytes} bytes). Likely cached response. Discarding sample."
+            )
+            test_valid = False
+        else:
+            mbps = round((final_bytes * 8) / (elapsed_total * 1_000_000), 3)
+
+        # FIX: Only append valid results to history
+        if test_valid:
+            _speed_history.append(mbps)
+            log.debug(f"Speed history updated: {list(_speed_history)}")
+        else:
+            log.debug(
+                f"Invalid speed test discarded. History unchanged: {list(_speed_history)}"
+            )
 
         table = Table(title="Speed Test Results")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
         table.add_row("Downloaded", f"{round(final_bytes / 1_000_000, 2)} MB")
         table.add_row("Elapsed", f"{round(elapsed_total, 2)}s")
-        table.add_row("Avg Download Speed", f"{mbps} Mbps")
+        if test_valid:
+            table.add_row("Avg Download Speed", f"{mbps} Mbps")
+        else:
+            table.add_row("Avg Download Speed", "[red]DISCARDED (cached/invalid)[/red]")
         table.add_row(
             f"Rolling Avg (last {len(_speed_history)})",
             f"{get_average_speed()} Mbps",
         )
         console.print(table)
 
-        log.info(
-            f"Speed Result: DL={mbps} Mbps | "
-            f"{round(final_bytes / 1_000_000, 2)} MB in {round(elapsed_total, 2)}s | "
-            f"Rolling avg={get_average_speed()} Mbps"
-        )
+        if test_valid:
+            log.info(
+                f"Speed Result: DL={mbps} Mbps | "
+                f"{round(final_bytes / 1_000_000, 2)} MB in {round(elapsed_total, 2)}s | "
+                f"Rolling avg={get_average_speed()} Mbps"
+            )
+        else:
+            log.warning(
+                f"Speed Result: DISCARDED | "
+                f"{round(final_bytes / 1_000_000, 2)} MB in {round(elapsed_total, 2)}s | "
+                f"Rolling avg={get_average_speed()} Mbps (unchanged)"
+            )
 
     except subprocess.TimeoutExpired:
         stop_event.set()
@@ -382,6 +429,7 @@ def main():
         f"interval={CHECK_INTERVAL}s, speed_interval={SPEED_CHECK_INTERVAL}s, "
         f"cooldown={COOLDOWN_PERIOD}s, speed_threshold={SPEED_DEGRADED_THRESHOLD}Mbps, "
         f"speed_rolling_window={SPEED_ROLLING_WINDOW}, "
+        f"min_valid_elapsed={SPEED_TEST_MIN_VALID_ELAPSED}s, "
         f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
     )
 
