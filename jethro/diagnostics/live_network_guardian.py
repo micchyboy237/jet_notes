@@ -28,7 +28,6 @@ COOLDOWN_PERIOD = 15  # Wait after applying a fix before re-checking
 MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
 DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
 INTERFACE_RECOVERY_TIMEOUT = 15
-SPEED_ROLLING_WINDOW = 5  # Number of recent speed samples to average
 
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
@@ -39,6 +38,7 @@ SPEED_TEST_BYTES_DEGRADED = 2_000_000  # 2MB for degraded connections (adaptive)
 SPEED_DEGRADED_THRESHOLD = 2.0  # Mbps threshold to trigger degraded mode + fix
 SPEED_TEST_PROGRESS_INTERVAL = 0.5
 SPEED_TEST_URL_TEMPLATE = "https://speed.cloudflare.com/__down?bytes={}"
+SPEED_ROLLING_WINDOW = 5  # Number of recent speed samples to average
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -97,6 +97,21 @@ def run_cmd(cmd, timeout=2):
     except Exception as e:
         log.error(f"Command failed: {cmd} | Exception: {e}")
         return ""
+
+
+def get_average_speed():
+    """
+    Returns rolling average of last N speed samples, or None if no data yet.
+    Uses a deque window of size SPEED_ROLLING_WINDOW for noise smoothing.
+    """
+    if not _speed_history:
+        return None
+    avg = round(sum(_speed_history) / len(_speed_history), 3)
+    log.debug(
+        f"Rolling avg speed: {avg} Mbps over {len(_speed_history)} sample(s) "
+        f"| History: {list(_speed_history)}"
+    )
+    return avg
 
 
 def check_health_scutil():
@@ -192,16 +207,16 @@ def _watch_speed_progress(tmp_path, stop_event, progress, task_id, total_bytes):
 def check_speed_live():
     """
     Adaptive download speed test via curl with dual progress display.
-    Uses smaller payload when recent speeds indicate degradation.
+    Uses smaller payload when rolling average indicates degradation.
     """
-    global _last_speed_mbps
-
-    # Adaptive test size based on average of last N speed
     avg_speed = get_average_speed()
+
+    # Adaptive test size based on rolling average (not just last result)
     if avg_speed is not None and avg_speed < SPEED_DEGRADED_THRESHOLD:
         test_bytes = SPEED_TEST_BYTES_DEGRADED
         log.info(
-            f"Using reduced test size ({test_bytes // 1_000_000}MB) due to degraded speed"
+            f"Using reduced test size ({test_bytes // 1_000_000}MB) "
+            f"due to degraded rolling avg: {avg_speed} Mbps"
         )
     else:
         test_bytes = SPEED_TEST_BYTES_NORMAL
@@ -263,7 +278,7 @@ def check_speed_live():
         final_bytes = os.path.getsize(tmp_path)
         mbps = round((final_bytes * 8) / (elapsed_total * 1_000_000), 3)
 
-        # Store speed result for degraded detection in main loop
+        # Append result to rolling history
         _speed_history.append(mbps)
         log.debug(f"Speed history updated: {list(_speed_history)}")
 
@@ -273,38 +288,36 @@ def check_speed_live():
         table.add_row("Downloaded", f"{round(final_bytes / 1_000_000, 2)} MB")
         table.add_row("Elapsed", f"{round(elapsed_total, 2)}s")
         table.add_row("Avg Download Speed", f"{mbps} Mbps")
+        table.add_row(
+            f"Rolling Avg (last {len(_speed_history)})",
+            f"{get_average_speed()} Mbps",
+        )
         console.print(table)
 
         log.info(
             f"Speed Result: DL={mbps} Mbps | "
-            f"{round(final_bytes / 1_000_000, 2)} MB in {round(elapsed_total, 2)}s"
+            f"{round(final_bytes / 1_000_000, 2)} MB in {round(elapsed_total, 2)}s | "
+            f"Rolling avg={get_average_speed()} Mbps"
         )
 
     except subprocess.TimeoutExpired:
         stop_event.set()
         _speed_history.append(0.0)
-        log.error("Speed test timed out")
-        log.warning(f"Appended 0.0 to history: {list(_speed_history)}")
+        log.warning(
+            f"Speed test timed out; appended 0.0 to history: {list(_speed_history)}"
+        )
     except Exception as e:
         stop_event.set()
         _speed_history.append(0.0)
-        log.error(f"Speed test failed: {e}")
-        log.warning(f"Appended 0.0 to history: {list(_speed_history)}")
+        log.warning(
+            f"Speed test failed: {e}; appended 0.0 to history: {list(_speed_history)}"
+        )
     finally:
         try:
             os.remove(tmp_path)
             log.debug(f"Temp file cleaned up: {tmp_path}")
         except OSError as e:
             log.warning(f"Could not remove temp file {tmp_path}: {e}")
-
-
-def get_average_speed():
-    """Returns rolling average of last N speed samples, or None if no data yet."""
-    if not _speed_history:
-        return None
-    avg = round(sum(_speed_history) / len(_speed_history), 3)
-    log.debug(f"Rolling avg speed: {avg} Mbps over {len(_speed_history)} sample(s)")
-    return avg
 
 
 def apply_fix(issue_type):
@@ -349,11 +362,6 @@ def apply_fix(issue_type):
         run_cmd("killall -HUP mDNSResponder", timeout=5)
         return True
 
-    # elif issue_type == "Speed Degraded":
-    #     log.info("Speed degraded; renewing DHCP as lightweight first step...")
-    #     run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
-    #     return True
-
     else:
         log.error(f"No fix defined for issue type: {issue_type}")
         return False
@@ -373,6 +381,7 @@ def main():
         f"Config: interface={INTERFACE}, check_ip={CHECK_IP}, "
         f"interval={CHECK_INTERVAL}s, speed_interval={SPEED_CHECK_INTERVAL}s, "
         f"cooldown={COOLDOWN_PERIOD}s, speed_threshold={SPEED_DEGRADED_THRESHOLD}Mbps, "
+        f"speed_rolling_window={SPEED_ROLLING_WINDOW}, "
         f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
     )
 
@@ -399,7 +408,6 @@ def main():
         else:
             # Display live countdown until next speed test
             remaining = int(SPEED_CHECK_INTERVAL - time_since_last_speed)
-            # Use end="\r" to update the line in-place without scrolling
             console.print(
                 f"[dim]Next speed test in: {remaining}s[/dim]      ", end="\r"
             )
@@ -407,7 +415,7 @@ def main():
         # Health check (L3/L4 layer)
         is_healthy, status = check_health_scutil()
 
-        # Check for speed degradation even when L3/L4 is healthy
+        # Check rolling average for speed degradation even when L3/L4 is healthy
         avg_speed = get_average_speed()
         if (
             is_healthy
@@ -418,7 +426,8 @@ def main():
             status = "Speed Degraded"
             log.warning(
                 f"L3/L4 healthy but rolling avg speed degraded: "
-                f"{avg_speed} Mbps (window={len(_speed_history)}) < {SPEED_DEGRADED_THRESHOLD} Mbps"
+                f"{avg_speed} Mbps (window={len(_speed_history)}) "
+                f"< {SPEED_DEGRADED_THRESHOLD} Mbps"
             )
 
         if is_healthy:
@@ -445,7 +454,6 @@ def main():
                     f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
                 )
 
-                # Honor apply_fix return value
                 fix_succeeded = apply_fix(status)
                 last_fix_time = time.time()
 
