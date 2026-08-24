@@ -372,10 +372,18 @@ def main():
             time.sleep(1)
             continue
 
-        # Periodic speed test
-        if current_time - last_speed_check > SPEED_CHECK_INTERVAL:
+        # Periodic speed test with countdown
+        time_since_last_speed = current_time - last_speed_check
+        if time_since_last_speed >= SPEED_CHECK_INTERVAL:
             check_speed_live()
-            last_speed_check = current_time
+            last_speed_check = time.time()
+        else:
+            # Display live countdown until next speed test
+            remaining = int(SPEED_CHECK_INTERVAL - time_since_last_speed)
+            # Use end="\r" to update the line in-place without scrolling
+            console.print(
+                f"[dim]Next speed test in: {remaining}s[/dim]      ", end="\r"
+            )
 
         # Health check (L3/L4 layer)
         is_healthy, status = check_health_scutil()
