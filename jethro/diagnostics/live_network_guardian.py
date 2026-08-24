@@ -12,10 +12,10 @@ from rich.table import Table
 # --- Configuration ---
 INTERFACE = "en1"
 CHECK_IP = "8.8.8.8"
-CHECK_INTERVAL = 5
-SPEED_CHECK_INTERVAL = 120  # was 600 — 5x more frequent, still safe
-COOLDOWN_PERIOD = 20  # was 60 — matches actual fix resolution times
-MAX_RETRIES = 3
+CHECK_INTERVAL = 5  # How often to run health check (seconds)
+SPEED_CHECK_INTERVAL = 120  # Was 600 — speed test every 2 min instead of 10
+COOLDOWN_PERIOD = 20  # Was 60 — matches actual fix resolution times
+MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
 DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
@@ -268,10 +268,11 @@ def main():
     log.debug(
         f"Config: interface={INTERFACE}, check_ip={CHECK_IP}, "
         f"interval={CHECK_INTERVAL}s, speed_interval={SPEED_CHECK_INTERVAL}s, "
-        f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
+        f"cooldown={COOLDOWN_PERIOD}s, debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
     )
 
     consecutive_failures = 0
+    auto_fix_paused = False  # NEW: tracks if auto-fix is truly paused after max retries
     last_fix_time = 0
     last_speed_check = 0
 
@@ -295,24 +296,38 @@ def main():
 
         if is_healthy:
             console.print("[green]✓[/green] Network Healthy", end="\r")
+            # Reset failure state only when network actually recovers
+            if consecutive_failures > 0 or auto_fix_paused:
+                log.info(
+                    f"Network recovered after {consecutive_failures} failure(s). "
+                    "Resuming auto-fix."
+                )
             consecutive_failures = 0
+            auto_fix_paused = False
         else:
             console.print(f"\n[red]✗[/red] {status}")
             log.warning(f"Health check failed: {status}")
             consecutive_failures += 1
 
-            if consecutive_failures <= MAX_RETRIES:
+            if auto_fix_paused:
+                # Do not apply more fixes — wait for manual recovery
+                log.error(
+                    f"Auto-fix paused. Still seeing '{status}'. "
+                    "Manual intervention required. Will resume once network recovers."
+                )
+            elif consecutive_failures <= MAX_RETRIES:
                 log.info(
                     f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
                 )
                 apply_fix(status)
                 last_fix_time = time.time()
             else:
+                # Max retries hit — pause auto-fix until recovery
                 log.error(
                     f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
-                    "Manual intervention required."
+                    "Pausing auto-fix until network recovers. Manual intervention required."
                 )
-                consecutive_failures = 0
+                auto_fix_paused = True
 
         time.sleep(CHECK_INTERVAL)
 
