@@ -20,16 +20,20 @@ from rich.table import Table
 # --- Configuration ---
 INTERFACE = "en1"
 CHECK_IP = "8.8.8.8"
-CHECK_INTERVAL = 5  # How often to run health check (seconds)
-SPEED_CHECK_INTERVAL = 15  # Speed test every 15 seconds
-COOLDOWN_PERIOD = 5  # Wait after applying a fix before re-checking
+CHECK_INTERVAL = 5  # Health check every 5 seconds
+SPEED_CHECK_INTERVAL = 30  # Speed test every 30s (reduced from 15s to avoid congestion)
+COOLDOWN_PERIOD = 15  # Stabilization after fix (increased from 5s for HW fixes)
 MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
 DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
-SPEED_TEST_BYTES = 10_000_000  # 10MB download size
-SPEED_TEST_PROGRESS_INTERVAL = 0.5  # How often to refresh live Mbps (seconds)
-SPEED_TEST_URL = f"https://speed.cloudflare.com/__down?bytes={SPEED_TEST_BYTES}"
+
+# Speed test configuration
+SPEED_TEST_BYTES_NORMAL = 10_000_000  # 10MB for healthy connections
+SPEED_TEST_BYTES_DEGRADED = 2_000_000  # 2MB for degraded connections (adaptive)
+SPEED_DEGRADED_THRESHOLD = 2.0  # Mbps threshold to trigger degraded mode + fix
+SPEED_TEST_PROGRESS_INTERVAL = 0.5
+SPEED_TEST_URL_TEMPLATE = "https://speed.cloudflare.com/__down?bytes={}"
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -55,9 +59,10 @@ if not log.handlers:
     log.addHandler(file_handler)
 
 
-# --- Module-level state for smart debug logging ---
+# --- Module-level state ---
 _last_health_status = None
 _last_debug_log_time = 0
+_last_speed_mbps = None  # Tracks last speed result for degraded detection
 
 
 def run_cmd(cmd, timeout=2):
@@ -78,22 +83,33 @@ def run_cmd(cmd, timeout=2):
 
 
 def check_health_scutil():
-    """Instant health check using scutil with smart debug logging."""
+    """
+    Instant health check using scutil with smart debug logging.
+    Now distinguishes between daemon hangs and genuine interface absence.
+    """
     global _last_health_status, _last_debug_log_time
 
-    nwi = run_cmd("scutil --nwi", timeout=1)
+    # Increased timeout from 1s → 3s to reduce false "Interface Missing"
+    nwi = run_cmd("scutil --nwi", timeout=3)
+
+    # FIX #1: Distinguish timeout/daemon hang from genuine interface absence
+    if nwi == "":
+        log.warning("scutil --nwi timed out or returned empty; possible daemon hang")
+        _last_health_status = "Scutil Timeout"
+        return False, "Scutil Timeout"
+
     if f"{INTERFACE} :" not in nwi:
         log.warning(f"Interface {INTERFACE} not found in NWI output")
         _last_health_status = "Interface Missing"
         return False, "Interface Missing"
 
-    reach = run_cmd(f"scutil -r {CHECK_IP}", timeout=1)
+    reach = run_cmd(f"scutil -r {CHECK_IP}", timeout=3)
     if "Reachable" not in reach:
         log.warning(f"IP {CHECK_IP} not reachable")
         _last_health_status = "Not Reachable"
         return False, "Not Reachable"
 
-    dns = run_cmd("scutil --dns", timeout=1)
+    dns = run_cmd("scutil --dns", timeout=3)
     if "resolver #1" in dns:
         resolver_block = dns.split("resolver #1")[1].split("resolver #2")[0]
         if "nameserver[0]" not in resolver_block:
@@ -123,7 +139,7 @@ def check_health_scutil():
     return True, current_status
 
 
-def _watch_speed_progress(tmp_path, stop_event, progress, task_id):
+def _watch_speed_progress(tmp_path, stop_event, progress, task_id, total_bytes):
     """
     Background thread: polls temp file size every SPEED_TEST_PROGRESS_INTERVAL seconds,
     updates Rich Progress bar with live Mbps reading.
@@ -136,7 +152,7 @@ def _watch_speed_progress(tmp_path, stop_event, progress, task_id):
         try:
             current_bytes = os.path.getsize(tmp_path)
         except OSError:
-            continue  # File not ready yet, skip this tick
+            continue
 
         now = time.time()
         elapsed = now - last_time
@@ -159,16 +175,23 @@ def _watch_speed_progress(tmp_path, stop_event, progress, task_id):
 
 def check_speed_live():
     """
-    Run a download speed test via curl with two simultaneous progress displays:
-      A) curl's built-in ASCII progress bar (-#) printed to terminal
-      B) Rich Progress bar showing live Mbps updated by a background watcher thread
-    Final result is shown in a Rich Table with accurate elapsed time.
+    Adaptive download speed test via curl with dual progress display.
+    Uses smaller payload when recent speeds indicate degradation.
     """
-    log.info(
-        f"Running speed test ({SPEED_TEST_BYTES // 1_000_000}MB from Cloudflare)..."
-    )
+    global _last_speed_mbps
 
-    # Write to a temp file so the watcher thread can poll its growing size
+    # FIX #2 (partial): Adaptive test size based on last known speed
+    if _last_speed_mbps is not None and _last_speed_mbps < SPEED_DEGRADED_THRESHOLD:
+        test_bytes = SPEED_TEST_BYTES_DEGRADED
+        log.info(
+            f"Using reduced test size ({test_bytes // 1_000_000}MB) due to degraded speed"
+        )
+    else:
+        test_bytes = SPEED_TEST_BYTES_NORMAL
+
+    url = SPEED_TEST_URL_TEMPLATE.format(test_bytes)
+    log.info(f"Running speed test ({test_bytes // 1_000_000}MB from Cloudflare)...")
+
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".speedtest")
     tmp_path = tmp_file.name
     tmp_file.close()
@@ -183,49 +206,48 @@ def check_speed_live():
             TransferSpeedColumn(),
             TimeRemainingColumn(),
             console=console,
-            transient=True,  # Clears the Rich bar after test completes
+            transient=True,
         ) as progress:
             task_id = progress.add_task(
                 "[cyan]Connecting...[/cyan]",
-                total=SPEED_TEST_BYTES,
+                total=test_bytes,
             )
 
-            # B: Start background thread to update Rich Progress with live Mbps
             watcher = threading.Thread(
                 target=_watch_speed_progress,
-                args=(tmp_path, stop_event, progress, task_id),
+                args=(tmp_path, stop_event, progress, task_id, test_bytes),
                 daemon=True,
             )
             watcher.start()
             log.debug("Speed watcher thread started")
 
-            # A: curl with -# ASCII progress bar; writes download to temp file
             start_time = time.time()
             subprocess.run(
                 [
                     "curl",
-                    "-#",  # A: ASCII progress bar in terminal
+                    "-#",
                     "-o",
-                    tmp_path,  # Write to temp file (enables watcher polling)
+                    tmp_path,
                     "--max-time",
                     "15",
-                    SPEED_TEST_URL,
+                    url,
                 ],
-                capture_output=False,  # Allow curl's -# bar to print to terminal
+                capture_output=False,
                 timeout=20,
             )
-            elapsed_total = max(time.time() - start_time, 0.1)  # Avoid divide-by-zero
+            elapsed_total = max(time.time() - start_time, 0.1)
 
-            # Signal watcher to stop and wait for clean exit
             stop_event.set()
             watcher.join(timeout=2)
             log.debug(
                 f"Speed watcher thread stopped. Elapsed: {round(elapsed_total, 2)}s"
             )
 
-        # Calculate final average speed from actual elapsed time
         final_bytes = os.path.getsize(tmp_path)
         mbps = round((final_bytes * 8) / (elapsed_total * 1_000_000), 3)
+
+        # FIX #2: Store speed result for degraded detection in main loop
+        _last_speed_mbps = mbps
 
         table = Table(title="Speed Test Results")
         table.add_column("Metric", style="cyan")
@@ -242,12 +264,13 @@ def check_speed_live():
 
     except subprocess.TimeoutExpired:
         stop_event.set()
+        _last_speed_mbps = 0.0
         log.error("Speed test timed out after 20s")
     except Exception as e:
         stop_event.set()
+        _last_speed_mbps = 0.0
         log.error(f"Speed test failed: {e}")
     finally:
-        # Always clean up temp file
         try:
             os.remove(tmp_path)
             log.debug(f"Temp file cleaned up: {tmp_path}")
@@ -256,26 +279,31 @@ def check_speed_live():
 
 
 def apply_fix(issue_type):
-    """Targeted fix with proper timeouts and verification."""
+    """
+    Targeted fix with proper timeouts and verification.
+    Returns True if fix was applied successfully, False otherwise.
+    """
     log.warning(f"Applying targeted fix for: {issue_type}")
 
-    if issue_type == "Scutil Timeout":  # NEW: distinguish from Interface Missing
-        log.info("System daemon may be hung; waiting before retry...")
-        time.sleep(5)  # Give configd time to recover
-        return False  # Signal: re-check, don't count as hardware fix
+    if issue_type == "Scutil Timeout":
+        log.info("System daemon may be hung; waiting 5s before retry...")
+        time.sleep(5)
+        return False  # Signal: re-check health, don't count as hardware fix attempt
 
     elif issue_type == "Interface Missing":
         log.info(f"Cycling power on {INTERFACE}...")
         run_cmd(f"sudo networksetup -setairportpower {INTERFACE} off", timeout=10)
         time.sleep(3)
         run_cmd(f"sudo networksetup -setairportpower {INTERFACE} on", timeout=10)
+
         # Verify recovery before returning
-        for _ in range(15):
+        for i in range(15):
             time.sleep(1)
-            if f"{INTERFACE} :" in run_cmd("scutil --nwi", timeout=3):
-                log.info(f"Interface {INTERFACE} recovered")
+            nwi = run_cmd("scutil --nwi", timeout=3)
+            if f"{INTERFACE} :" in nwi:
+                log.info(f"Interface {INTERFACE} recovered after {i + 1}s")
                 return True
-        log.error(f"Power cycle failed to restore {INTERFACE}")
+        log.error(f"Power cycle failed to restore {INTERFACE} after 15s")
         return False
 
     elif issue_type == "Not Reachable":
@@ -284,18 +312,18 @@ def apply_fix(issue_type):
         return True
 
     elif issue_type == "DNS Missing":
-        log.info("Flushing DNS cache...")
+        log.info("Flushing DNS cache and restarting mDNSResponder...")
         run_cmd("sudo dscacheutil -flushcache", timeout=5)
         run_cmd("sudo killall -HUP mDNSResponder", timeout=5)
         return True
 
-    elif issue_type == "Speed Degraded":  # NEW: address 0 Mbps healthy-but-broken
+    elif issue_type == "Speed Degraded":
         log.info("Speed degraded; renewing DHCP as lightweight first step...")
         run_cmd(f"sudo ipconfig set {INTERFACE} DHCP", timeout=10)
         return True
 
     else:
-        log.error(f"No fix defined for: {issue_type}")
+        log.error(f"No fix defined for issue type: {issue_type}")
         return False
 
 
@@ -310,7 +338,8 @@ def main():
     log.debug(
         f"Config: interface={INTERFACE}, check_ip={CHECK_IP}, "
         f"interval={CHECK_INTERVAL}s, speed_interval={SPEED_CHECK_INTERVAL}s, "
-        f"cooldown={COOLDOWN_PERIOD}s, debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
+        f"cooldown={COOLDOWN_PERIOD}s, speed_threshold={SPEED_DEGRADED_THRESHOLD}Mbps, "
+        f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
     )
 
     consecutive_failures = 0
@@ -333,8 +362,20 @@ def main():
             check_speed_live()
             last_speed_check = current_time
 
-        # Health check
+        # Health check (L3/L4 layer)
         is_healthy, status = check_health_scutil()
+
+        # FIX #2 (integration): Check for speed degradation even when L3/L4 is healthy
+        if (
+            is_healthy
+            and _last_speed_mbps is not None
+            and _last_speed_mbps < SPEED_DEGRADED_THRESHOLD
+        ):
+            is_healthy = False
+            status = "Speed Degraded"
+            log.warning(
+                f"L3/L4 healthy but speed degraded: {_last_speed_mbps} Mbps < {SPEED_DEGRADED_THRESHOLD} Mbps"
+            )
 
         if is_healthy:
             console.print("[green]✓[/green] Network Healthy", end="\r")
@@ -359,8 +400,16 @@ def main():
                 log.info(
                     f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
                 )
-                apply_fix(status)
+
+                # FIX #3: Honor apply_fix return value
+                fix_succeeded = apply_fix(status)
                 last_fix_time = time.time()
+
+                if not fix_succeeded:
+                    log.warning(
+                        f"Fix for '{status}' reported failure. "
+                        f"Counting as attempt {consecutive_failures}/{MAX_RETRIES}."
+                    )
             else:
                 log.error(
                     f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
