@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Mac Network Monitor - Real-time monitoring (FINAL FIXED VERSION)
+# Mac Network Monitor - With Speed Test
 # Usage: ./network-monitor.sh
 # =============================================================================
 
@@ -9,6 +9,7 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 
@@ -21,28 +22,21 @@ if [ -z "$WIFI_DEVICE" ]; then
     exit 1
 fi
 
+# Speed test configuration
+SPEED_TEST_URL="http://speedtest.tele2.net/1MB.zip"  # Reliable 1MB test file
+SPEED_TEST_TIMEOUT=10  # seconds
+
 echo -e "${YELLOW}Network Monitor - Press Ctrl+C to stop${NC}"
 echo -e "${CYAN}Device: $WIFI_DEVICE | Service: $WIFI_SERVICE${NC}"
 echo ""
 
-# Function to get clean IP info using ifconfig (more reliable than networksetup)
+# Function to get clean IP info
 get_ip_info() {
     local device="$1"
-    ifconfig "$device" 2>/dev/null | awk '/inet / && !/inet6/ {
-        ip=$2;
-        # Get subnet mask
-        for(i=1;i<=NF;i++) {
-            if($i ~ /^mask/) {
-                mask=$(strtonum("0x" substr($i,6)));
-                break;
-            }
-        }
-        print ip;
-        print mask;
-    }' | head -2
+    ifconfig "$device" 2>/dev/null | awk '/inet / && !/inet6/ {print $2}' | head -1
 }
 
-# Function to get gateway using netstat
+# Function to get gateway
 get_gateway() {
     local device="$1"
     netstat -rn 2>/dev/null | grep "default" | grep "$device" | awk '{print $2}' | head -1
@@ -57,10 +51,65 @@ get_dns_servers() {
     if [[ "$dns_output" == *"There aren't any DNS Servers"* ]]; then
         echo ""
     else
-        # Extract only valid IPv4 addresses
         echo "$dns_output" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | tr '\n' ' ' | sed 's/ $//'
     fi
 }
+
+# Function to categorize speed
+categorize_speed() {
+    local speed_mbps=$1
+    
+    if (( $(echo "$speed_mbps < 1" | bc -l) )); then
+        echo "${RED}Very Slow (< 1 Mbps)"
+    elif (( $(echo "$speed_mbps < 5" | bc -l) )); then
+        echo "${YELLOW}Slow (1-5 Mbps)"
+    elif (( $(echo "$speed_mbps < 25" | bc -l) )); then
+        echo "${CYAN}Moderate (5-25 Mbps)"
+    elif (( $(echo "$speed_mbps < 100" | bc -l) )); then
+        echo "${GREEN}Fast (25-100 Mbps)"
+    elif (( $(echo "$speed_mbps < 500" | bc -l) )); then
+        echo "${GREEN}Very Fast (100-500 Mbps)"
+    else
+        echo "${MAGENTA}Ultra Fast (> 500 Mbps)"
+    fi
+}
+
+# Function to test download speed
+test_download_speed() {
+    local url="$1"
+    local temp_file="/tmp/speedtest_$$"
+    
+    # Download and measure time
+    local start_time=$(date +%s%N)
+    curl -L -o "$temp_file" --max-time $SPEED_TEST_TIMEOUT -s -w "%{size_download}" "$url" 2>/dev/null
+    local end_time=$(date +%s%N)
+    local bytes_downloaded=$(wc -c < "$temp_file" 2>/dev/null || echo "0")
+    
+    # Cleanup
+    rm -f "$temp_file"
+    
+    # Calculate speed in Mbps
+    if [ "$bytes_downloaded" -gt 0 ] 2>/dev/null; then
+        local duration_ns=$((end_time - start_time))
+        local duration_s=$(echo "scale=3; $duration_ns / 1000000000" | bc -l)
+        
+        if (( $(echo "$duration_s > 0" | bc -l) )); then
+            local bits=$(echo "$bytes_downloaded * 8" | bc)
+            local speed_mbps=$(echo "scale=2; $bits / $duration_s / 1000000" | bc -l)
+            echo "$speed_mbps"
+        else
+            echo "0"
+        fi
+    else
+        echo "0"
+    fi
+}
+
+# Track last speed test time
+LAST_SPEED_TEST=0
+SPEED_TEST_INTERVAL=30  # Test speed every 30 seconds
+CACHED_SPEED="N/A"
+CACHED_CATEGORY=""
 
 while true; do
     clear
@@ -85,28 +134,16 @@ while true; do
         echo -e "Network: ${GREEN}$CURRENT_NET${NC}"
     fi
     
-    # IP Configuration - Using ifconfig (more reliable)
-    IP_INFO=$(get_ip_info "$WIFI_DEVICE")
-    IP_ADDR=$(echo "$IP_INFO" | sed -n '1p')
-    SUBNET_HEX=$(echo "$IP_INFO" | sed -n '2p')
+    # IP Configuration
+    IP_ADDR=$(get_ip_info "$WIFI_DEVICE")
     
     if [ -n "$IP_ADDR" ] && [ "$IP_ADDR" != "0.0.0.0" ]; then
         echo -e "IP: ${GREEN}$IP_ADDR${NC}"
-        
-        # Convert hex subnet to dotted decimal if available
-        if [ -n "$SUBNET_HEX" ]; then
-            SUBNET_DEC=$(printf "%d.%d.%d.%d\n" \
-                $(( (SUBNET_HEX >> 24) & 255 )) \
-                $(( (SUBNET_HEX >> 16) & 255 )) \
-                $(( (SUBNET_HEX >> 8) & 255 )) \
-                $(( SUBNET_HEX & 255 )) 2>/dev/null || echo "255.255.255.0")
-            echo -e "Subnet: $SUBNET_DEC"
-        fi
     else
         echo -e "IP: ${RED}None${NC}"
     fi
     
-    # Gateway - Using netstat (more reliable)
+    # Gateway
     GATEWAY=$(get_gateway "$WIFI_DEVICE")
     
     if [ -n "$GATEWAY" ]; then
@@ -128,14 +165,12 @@ while true; do
     echo ""
     echo -e "${CYAN}━━━ Connectivity Tests ━━━${NC}"
     
-    # Internet test
     if ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
         echo -e "Internet (8.8.8.8): ${GREEN}✓ Connected${NC}"
     else
         echo -e "Internet (8.8.8.8): ${RED}✗ Disconnected${NC}"
     fi
     
-    # Gateway test
     if [ -n "$GATEWAY" ]; then
         if ping -c 1 -W 1 "$GATEWAY" >/dev/null 2>&1; then
             echo -e "Gateway ($GATEWAY): ${GREEN}✓ Reachable${NC}"
@@ -146,33 +181,65 @@ while true; do
         echo -e "Gateway: ${YELLOW}⊘ No gateway to test${NC}"
     fi
     
-    # DNS test
     if nslookup google.com >/dev/null 2>&1; then
         echo -e "DNS Resolution: ${GREEN}✓ Working${NC}"
     else
         echo -e "DNS Resolution: ${RED}✗ Failed${NC}"
     fi
     
-    # Signal Strength
-    AIRPORT_CMD="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
-    if command -v "$AIRPORT_CMD" >/dev/null 2>&1; then
+    # Speed Test Section
+    echo ""
+    echo -e "${MAGENTA}━━━ Download Speed ━━━${NC}"
+    
+    CURRENT_TIME=$(date +%s)
+    TIME_SINCE_LAST=$((CURRENT_TIME - LAST_SPEED_TEST))
+    
+    # Only test if enough time has passed or first run
+    if [ "$LAST_SPEED_TEST" -eq 0 ] || [ "$TIME_SINCE_LAST" -ge $SPEED_TEST_INTERVAL ]; then
+        echo -e "${YELLOW}Testing speed...${NC}"
+        
+        SPEED_MBPS=$(test_download_speed "$SPEED_TEST_URL")
+        
+        if [ "$SPEED_MBPS" != "0" ] && [ -n "$SPEED_MBPS" ]; then
+            CACHED_SPEED="$SPEED_MBPS"
+            CACHED_CATEGORY=$(categorize_speed "$SPEED_MBPS")
+            LAST_SPEED_TEST=$CURRENT_TIME
+            echo -e "Speed: ${WHITE}${SPEED_MBPS} Mbps${NC}"
+            echo -e "Category: $CACHED_CATEGORY${NC}"
+        else
+            echo -e "Speed: ${YELLOW}Test failed or timed out${NC}"
+            CACHED_SPEED="N/A"
+            CACHED_CATEGORY=""
+        fi
+    else
+        # Show cached results
+        if [ "$CACHED_SPEED" != "N/A" ]; then
+            echo -e "Speed: ${WHITE}${CACHED_SPEED} Mbps${NC}"
+            echo -e "Category: $CACHED_CATEGORY${NC}"
+        else
+            echo -e "Speed: ${YELLOW}Waiting for next test...${NC}"
+        fi
+        
+        REMAINING=$((SPEED_TEST_INTERVAL - TIME_SINCE_LAST))
+        echo -e "${CYAN}(Next test in ${REMAINING}s)${NC}"
+    fi
+    
+    # Signal Strength (if available)
+    AIRPORT_CMD=$(which airport 2>/dev/null || find /System/Library -name "airport" -type f 2>/dev/null | head -1)
+    if [ -n "$AIRPORT_CMD" ] && [ -x "$AIRPORT_CMD" ]; then
         SIGNAL_INFO=$("$AIRPORT_CMD" -I 2>/dev/null)
         if [ -n "$SIGNAL_INFO" ]; then
             RSSI=$(echo "$SIGNAL_INFO" | grep "agrCtlRSSI" | awk '{print $2}')
             
             if [ -n "$RSSI" ] && [ "$RSSI" != "-1" ]; then
                 if [ "$RSSI" -gt -50 ]; then
-                    SIGNAL_COLOR="$GREEN"
-                    SIGNAL_QUALITY="Excellent"
+                    SIGNAL_COLOR="$GREEN"; SIGNAL_QUALITY="Excellent"
                 elif [ "$RSSI" -gt -60 ]; then
-                    SIGNAL_COLOR="$GREEN"
-                    SIGNAL_QUALITY="Good"
+                    SIGNAL_COLOR="$GREEN"; SIGNAL_QUALITY="Good"
                 elif [ "$RSSI" -gt -70 ]; then
-                    SIGNAL_COLOR="$YELLOW"
-                    SIGNAL_QUALITY="Fair"
+                    SIGNAL_COLOR="$YELLOW"; SIGNAL_QUALITY="Fair"
                 else
-                    SIGNAL_COLOR="$RED"
-                    SIGNAL_QUALITY="Poor"
+                    SIGNAL_COLOR="$RED"; SIGNAL_QUALITY="Poor"
                 fi
                 
                 echo ""
@@ -185,7 +252,6 @@ while true; do
     echo ""
     echo -e "${CYAN}━━━ Additional Info ━━━${NC}"
     
-    # Proxy check
     PROXY_ENABLED=$(networksetup -getwebproxy "$WIFI_SERVICE" 2>/dev/null | grep "Enabled: Yes")
     if [ -n "$PROXY_ENABLED" ]; then
         echo -e "Proxy: ${YELLOW}⚠ Enabled${NC}"
@@ -193,7 +259,6 @@ while true; do
         echo -e "Proxy: ${GREEN}Disabled${NC}"
     fi
     
-    # MTU
     MTU=$(networksetup -getMTU "$WIFI_DEVICE" 2>/dev/null | awk '{print $NF}')
     if [ -n "$MTU" ] && [[ "$MTU" =~ ^[0-9]+$ ]]; then
         echo -e "MTU: $MTU"
