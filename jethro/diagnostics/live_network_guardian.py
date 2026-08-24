@@ -43,6 +43,7 @@ SPEED_ROLLING_WINDOW = 3  # Number of recent speed samples to average
 # FIX: Minimum elapsed time threshold to consider a speed test valid (seconds).
 # Transfers completing faster than this are likely cached responses.
 SPEED_TEST_MIN_VALID_ELAPSED = 0.5
+SPEED_TEST_MAX_DURATION_SEC = 15
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -273,7 +274,7 @@ def check_speed_live():
                     "-o",
                     tmp_path,
                     "--max-time",
-                    "15",
+                    str(SPEED_TEST_MAX_DURATION_SEC),
                     "-H",
                     "Cache-Control: no-cache, no-store, must-revalidate",
                     "-H",
