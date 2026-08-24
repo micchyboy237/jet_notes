@@ -13,8 +13,8 @@ from rich.table import Table
 INTERFACE = "en1"
 CHECK_IP = "8.8.8.8"
 CHECK_INTERVAL = 5
-SPEED_CHECK_INTERVAL = 600
-COOLDOWN_PERIOD = 60
+SPEED_CHECK_INTERVAL = 120  # was 600 — 5x more frequent, still safe
+COOLDOWN_PERIOD = 20  # was 60 — matches actual fix resolution times
 MAX_RETRIES = 3
 DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
