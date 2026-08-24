@@ -1,37 +1,36 @@
+import json
 import logging
 import os
 import subprocess
 import time
 
+import httpx
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
+from rich.table import Table
 
 # --- Configuration ---
-INTERFACE = "en1"  # Based on your scutil output
-CHECK_IP = "8.8.8.8"
-CHECK_INTERVAL = 30  # Check every 30 seconds
-COOLDOWN_PERIOD = 120  # Wait 2 minutes after a fix before checking again
-MAX_RETRIES = 3  # Max fixes before giving up for a while
+INTERFACE = "en1"
+CHECK_URL = "https://www.apple.com/library/test/success.html"
+CHECK_INTERVAL = 30
+SPEED_CHECK_INTERVAL = 300  # Check speed every 5 minutes
+COOLDOWN_PERIOD = 120
+MAX_RETRIES = 3
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
-LOG_FILE = os.path.join(LOG_DIR, "live_network_diagnostics_autofix.log")
+LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
 
-# Ensure log directory exists
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# --- Rich Logging Setup ---
+# --- Logging Setup ---
 console = Console()
-
-# Create logger
 log = logging.getLogger("NetworkGuardian")
 log.setLevel(logging.INFO)
 
-# 1. Console Handler (Rich) - For beautiful terminal output
 rich_handler = RichHandler(rich_tracebacks=True, console=console, show_time=False)
 rich_handler.setFormatter(logging.Formatter("%(message)s"))
 log.addHandler(rich_handler)
 
-# 2. File Handler - For persistent logging
 file_handler = logging.FileHandler(LOG_FILE)
 file_handler.setFormatter(
     logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -40,10 +39,9 @@ log.addHandler(file_handler)
 
 
 def run_cmd(cmd):
-    """Run a shell command and return stdout."""
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=5
+            cmd, shell=True, capture_output=True, text=True, timeout=15
         )
         return result.stdout.strip()
     except Exception as e:
@@ -51,35 +49,41 @@ def run_cmd(cmd):
         return ""
 
 
-def check_health():
-    """Perform the hybrid health check."""
-    # 1. Interface Check
-    nwi = run_cmd("scutil --nwi")
-    if f"{INTERFACE} :" not in nwi:
-        return False, "Interface Missing"
+def check_connectivity():
+    """Modern check using httpx."""
+    try:
+        with httpx.Client(timeout=5) as client:
+            response = client.head(CHECK_URL)
+            return response.status_code == 200
+    except Exception:
+        return False
 
-    # 2. Reachability Check
-    reach = run_cmd(f"scutil -r {CHECK_IP}")
-    if "Reachable" not in reach:
-        return False, "Not Reachable"
 
-    # 3. DNS Check
-    dns = run_cmd("scutil --dns")
-    resolver_1 = (
-        dns.split("resolver #1")[1].split("resolver #2")[0]
-        if "resolver #1" in dns
-        else ""
-    )
-    if "nameserver[0]" not in resolver_1:
-        return False, "DNS Missing"
+def check_speed():
+    """Use macOS built-in networkQuality for accurate M1 metrics."""
+    log.info("Running speed and responsiveness test...")
+    output = run_cmd("networkQuality -c")
+    try:
+        data = json.loads(output)
+        dl = data.get("download_capacity", "N/A")
+        ul = data.get("upload_capacity", "N/A")
+        resp = data.get("responsiveness", "N/A")
 
-    return True, "Healthy"
+        table = Table(title="Network Quality Report")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Download", f"{dl} Mbps")
+        table.add_row("Upload", f"{ul} Mbps")
+        table.add_row("Responsiveness", resp)
+        console.print(table)
+
+        log.info(f"Speed Test - DL: {dl}, UL: {ul}, Resp: {resp}")
+    except json.JSONDecodeError:
+        log.warning("Could not parse networkQuality output.")
 
 
 def apply_fix(issue_type):
-    """Apply targeted fixes."""
     log.warning(f"Applying fix for: {issue_type}")
-
     if issue_type == "Interface Missing":
         run_cmd(f"sudo networksetup -setairportpower {INTERFACE} off")
         time.sleep(5)
@@ -93,20 +97,16 @@ def apply_fix(issue_type):
 
 def main():
     log.info(
-        Panel.fit(
-            "[bold blue]Network Guardian Live[/bold blue]\nMonitoring interface: en1",
-            border_style="blue",
-        )
+        Panel.fit("[bold blue]Network Guardian Live[/bold blue]", border_style="blue")
     )
-    log.info(f"Logs are being saved to: {LOG_FILE}")
 
     consecutive_failures = 0
     last_fix_time = 0
+    last_speed_check = 0
 
     while True:
         current_time = time.time()
 
-        # Skip checks if we are in a cooldown period after a fix
         if current_time - last_fix_time < COOLDOWN_PERIOD:
             remaining = int(COOLDOWN_PERIOD - (current_time - last_fix_time))
             console.print(
@@ -115,22 +115,24 @@ def main():
             time.sleep(1)
             continue
 
-        is_healthy, status = check_health()
+        # Periodic Speed Check
+        if current_time - last_speed_check > SPEED_CHECK_INTERVAL:
+            check_speed()
+            last_speed_check = current_time
 
-        if is_healthy:
-            console.print(f"[green]✓[/green] Network is {status}", end="\r")
+        if check_connectivity():
+            console.print(f"[green]✓[/green] Network is Healthy", end="\r")
             consecutive_failures = 0
         else:
-            console.print(f"\n[red]✗[/red] Issue detected: {status}")
+            console.print(f"\n[red]✗[/red] Connectivity Lost")
             consecutive_failures += 1
 
             if consecutive_failures <= MAX_RETRIES:
-                apply_fix(status)
+                apply_fix("Not Reachable")
                 last_fix_time = time.time()
-                log.info("Entering cooldown period to allow network to stabilize...")
             else:
-                log.error("Max retries reached. Manual intervention may be required.")
-                consecutive_failures = 0  # Reset to keep trying occasionally
+                log.error("Max retries reached.")
+                consecutive_failures = 0
 
         time.sleep(CHECK_INTERVAL)
 
@@ -139,4 +141,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log.info("\n[bold]Network Guardian stopped by user.[/bold]")
+        log.info("\n[bold]Network Guardian stopped.[/bold]")

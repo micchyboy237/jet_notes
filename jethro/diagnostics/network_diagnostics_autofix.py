@@ -4,7 +4,7 @@ import sys
 import time
 
 # --- Configuration ---
-LOG_FILE = "/Users/jethroestrada/Library/Logs/network_guardian.log"
+LOG_FILE = "/Users/jethroestrada/Library/Logs/network_diagnostics_autofix.log"
 CHECK_IP = "8.8.8.8"
 INTERFACE = "en1"  # Based on your scutil output, your active interface is en1
 
