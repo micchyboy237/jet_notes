@@ -256,22 +256,47 @@ def check_speed_live():
 
 
 def apply_fix(issue_type):
-    """Apply corrective action for detected network issues."""
-    log.warning(f"Applying fix for: {issue_type}")
-    if issue_type == "Interface Missing":
+    """Targeted fix with proper timeouts and verification."""
+    log.warning(f"Applying targeted fix for: {issue_type}")
+
+    if issue_type == "Scutil Timeout":  # NEW: distinguish from Interface Missing
+        log.info("System daemon may be hung; waiting before retry...")
+        time.sleep(5)  # Give configd time to recover
+        return False  # Signal: re-check, don't count as hardware fix
+
+    elif issue_type == "Interface Missing":
         log.info(f"Cycling power on {INTERFACE}...")
-        run_cmd(f"sudo networksetup -setairportpower {INTERFACE} off")
+        run_cmd(f"sudo networksetup -setairportpower {INTERFACE} off", timeout=10)
         time.sleep(3)
-        run_cmd(f"sudo networksetup -setairportpower {INTERFACE} on")
+        run_cmd(f"sudo networksetup -setairportpower {INTERFACE} on", timeout=10)
+        # Verify recovery before returning
+        for _ in range(15):
+            time.sleep(1)
+            if f"{INTERFACE} :" in run_cmd("scutil --nwi", timeout=3):
+                log.info(f"Interface {INTERFACE} recovered")
+                return True
+        log.error(f"Power cycle failed to restore {INTERFACE}")
+        return False
+
     elif issue_type == "Not Reachable":
         log.info(f"Renewing DHCP lease on {INTERFACE}...")
-        run_cmd(f"sudo ipconfig set {INTERFACE} DHCP")
+        run_cmd(f"sudo ipconfig set {INTERFACE} DHCP", timeout=10)
+        return True
+
     elif issue_type == "DNS Missing":
-        log.info("Flushing DNS cache and restarting mDNSResponder...")
-        run_cmd("sudo dscacheutil -flushcache")
-        run_cmd("sudo killall -HUP mDNSResponder")
+        log.info("Flushing DNS cache...")
+        run_cmd("sudo dscacheutil -flushcache", timeout=5)
+        run_cmd("sudo killall -HUP mDNSResponder", timeout=5)
+        return True
+
+    elif issue_type == "Speed Degraded":  # NEW: address 0 Mbps healthy-but-broken
+        log.info("Speed degraded; renewing DHCP as lightweight first step...")
+        run_cmd(f"sudo ipconfig set {INTERFACE} DHCP", timeout=10)
+        return True
+
     else:
-        log.error(f"No fix defined for issue type: {issue_type}")
+        log.error(f"No fix defined for: {issue_type}")
+        return False
 
 
 def main():
