@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -65,6 +66,18 @@ _last_debug_log_time = 0
 _last_speed_mbps = None  # Tracks last speed result for degraded detection
 
 
+def require_root():
+    """Exit with error if not running as root."""
+    if os.geteuid() != 0:
+        console.print(
+            "\n[bold red]✗ Network Guardian must be run as root.[/bold red]\n"
+            "[yellow]Please re-run with sudo:[/yellow]\n"
+            f"[cyan]sudo python3 {os.path.abspath(__file__)}[/cyan]\n"
+        )
+        sys.exit(1)
+    log.info("Running as root; privilege check passed")
+
+
 def run_cmd(cmd, timeout=2):
     """Run a shell command safely. Returns stdout only; does NOT auto-log output."""
     try:
@@ -85,14 +98,13 @@ def run_cmd(cmd, timeout=2):
 def check_health_scutil():
     """
     Instant health check using scutil with smart debug logging.
-    Now distinguishes between daemon hangs and genuine interface absence.
+    Distinguishes between daemon hangs and genuine interface absence.
     """
     global _last_health_status, _last_debug_log_time
 
-    # Increased timeout from 1s → 3s to reduce false "Interface Missing"
     nwi = run_cmd("scutil --nwi", timeout=3)
 
-    # FIX #1: Distinguish timeout/daemon hang from genuine interface absence
+    # Distinguish timeout/daemon hang from genuine interface absence
     if nwi == "":
         log.warning("scutil --nwi timed out or returned empty; possible daemon hang")
         _last_health_status = "Scutil Timeout"
@@ -180,7 +192,7 @@ def check_speed_live():
     """
     global _last_speed_mbps
 
-    # FIX #2 (partial): Adaptive test size based on last known speed
+    # Adaptive test size based on last known speed
     if _last_speed_mbps is not None and _last_speed_mbps < SPEED_DEGRADED_THRESHOLD:
         test_bytes = SPEED_TEST_BYTES_DEGRADED
         log.info(
@@ -246,7 +258,7 @@ def check_speed_live():
         final_bytes = os.path.getsize(tmp_path)
         mbps = round((final_bytes * 8) / (elapsed_total * 1_000_000), 3)
 
-        # FIX #2: Store speed result for degraded detection in main loop
+        # Store speed result for degraded detection in main loop
         _last_speed_mbps = mbps
 
         table = Table(title="Speed Test Results")
@@ -282,6 +294,7 @@ def apply_fix(issue_type):
     """
     Targeted fix with proper timeouts and verification.
     Returns True if fix was applied successfully, False otherwise.
+    Note: No 'sudo' prefix needed — process runs as root via require_root().
     """
     log.warning(f"Applying targeted fix for: {issue_type}")
 
@@ -292,9 +305,9 @@ def apply_fix(issue_type):
 
     elif issue_type == "Interface Missing":
         log.info(f"Cycling power on {INTERFACE}...")
-        run_cmd(f"sudo networksetup -setairportpower {INTERFACE} off", timeout=10)
+        run_cmd(f"networksetup -setairportpower {INTERFACE} off", timeout=10)
         time.sleep(3)
-        run_cmd(f"sudo networksetup -setairportpower {INTERFACE} on", timeout=10)
+        run_cmd(f"networksetup -setairportpower {INTERFACE} on", timeout=10)
 
         # Verify recovery before returning
         for i in range(15):
@@ -308,18 +321,18 @@ def apply_fix(issue_type):
 
     elif issue_type == "Not Reachable":
         log.info(f"Renewing DHCP lease on {INTERFACE}...")
-        run_cmd(f"sudo ipconfig set {INTERFACE} DHCP", timeout=10)
+        run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
         return True
 
     elif issue_type == "DNS Missing":
         log.info("Flushing DNS cache and restarting mDNSResponder...")
-        run_cmd("sudo dscacheutil -flushcache", timeout=5)
-        run_cmd("sudo killall -HUP mDNSResponder", timeout=5)
+        run_cmd("dscacheutil -flushcache", timeout=5)
+        run_cmd("killall -HUP mDNSResponder", timeout=5)
         return True
 
     elif issue_type == "Speed Degraded":
         log.info("Speed degraded; renewing DHCP as lightweight first step...")
-        run_cmd(f"sudo ipconfig set {INTERFACE} DHCP", timeout=10)
+        run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
         return True
 
     else:
@@ -328,6 +341,8 @@ def apply_fix(issue_type):
 
 
 def main():
+    require_root()
+
     console.print(
         Panel.fit(
             "[bold blue]Network Guardian Fast[/bold blue]\nReal-time scutil monitoring",
@@ -365,7 +380,7 @@ def main():
         # Health check (L3/L4 layer)
         is_healthy, status = check_health_scutil()
 
-        # FIX #2 (integration): Check for speed degradation even when L3/L4 is healthy
+        # Check for speed degradation even when L3/L4 is healthy
         if (
             is_healthy
             and _last_speed_mbps is not None
@@ -401,7 +416,7 @@ def main():
                     f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
                 )
 
-                # FIX #3: Honor apply_fix return value
+                # Honor apply_fix return value
                 fix_succeeded = apply_fix(status)
                 last_fix_time = time.time()
 
