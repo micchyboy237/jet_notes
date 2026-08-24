@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import subprocess
@@ -12,15 +11,14 @@ from rich.table import Table
 # --- Configuration ---
 INTERFACE = "en1"
 CHECK_IP = "8.8.8.8"
-CHECK_INTERVAL = 5  # How often to run health check (seconds)
-SPEED_CHECK_INTERVAL = 120  # Was 600 — speed test every 2 min instead of 10
-COOLDOWN_PERIOD = 20  # Was 60 — matches actual fix resolution times
-MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
-DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
+CHECK_INTERVAL = 5
+SPEED_CHECK_INTERVAL = 120
+COOLDOWN_PERIOD = 20
+MAX_RETRIES = 3
+DEBUG_LOG_MIN_INTERVAL = 300
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
-APPLE_CDN_URL = "https://mensura.cdn-apple.com/.well-known/nq"
-FALLBACK_TEST_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
+SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -99,7 +97,6 @@ def check_health_scutil():
     current_status = "Healthy"
     now = time.time()
 
-    # Only dump full debug on state change or periodic interval
     if current_status != _last_health_status or (
         now - _last_debug_log_time > DEBUG_LOG_MIN_INTERVAL
     ):
@@ -114,54 +111,9 @@ def check_health_scutil():
     return True, current_status
 
 
-def _check_speed_apple():
-    """Attempt speed test via networkQuality JSON mode. Returns True on success."""
-    try:
-        result = subprocess.run(
-            ["networkQuality", "-s", "-c"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            log.warning(
-                f"networkQuality failed: rc={result.returncode}, stderr={result.stderr.strip()[:200]}"
-            )
-            return False
-
-        data = json.loads(result.stdout)
-        dl_mbps = round(data.get("dl_throughput", 0) / 1_000_000, 3)
-        ul_mbps = round(data.get("ul_throughput", 0) / 1_000_000, 3)
-        dl_rpm = data.get("dl_responsiveness", {}).get("rpm", 0)
-        ul_rpm = data.get("ul_responsiveness", {}).get("rpm", 0)
-
-        table = Table(title="Speed Test Results (Apple)")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
-        table.add_row("Download", f"{dl_mbps} Mbps ({dl_rpm} RPM)")
-        table.add_row("Upload", f"{ul_mbps} Mbps ({ul_rpm} RPM)")
-        console.print(table)
-
-        log.info(
-            f"Speed Results: DL={dl_mbps} Mbps, UL={ul_mbps} Mbps, "
-            f"DL_RPM={dl_rpm}, UL_RPM={ul_rpm}"
-        )
-        return True
-
-    except subprocess.TimeoutExpired:
-        log.warning("networkQuality timed out after 30s")
-        return False
-    except json.JSONDecodeError as e:
-        log.warning(f"JSON parse failed: {e}")
-        return False
-    except Exception as e:
-        log.warning(f"networkQuality exception: {e}")
-        return False
-
-
-def _check_speed_fallback():
-    """Fallback download-only speed test via curl."""
-    log.info(f"Running fallback download test from {FALLBACK_TEST_URL}")
+def check_speed_live():
+    """Run a download speed test via curl against Cloudflare."""
+    log.info(f"Running speed test from {SPEED_TEST_URL}...")
     try:
         result = subprocess.run(
             [
@@ -173,7 +125,7 @@ def _check_speed_fallback():
                 "%{speed_download}",
                 "--max-time",
                 "15",
-                FALLBACK_TEST_URL,
+                SPEED_TEST_URL,
             ],
             capture_output=True,
             text=True,
@@ -182,60 +134,20 @@ def _check_speed_fallback():
         speed_bytes = float(result.stdout.strip())
         mbps = round(speed_bytes * 8 / 1_000_000, 3)
 
-        table = Table(title="Fallback Speed Test (Download Only)")
+        table = Table(title="Speed Test Results")
         table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="yellow")
+        table.add_column("Value", style="green")
         table.add_row("Download", f"{mbps} Mbps")
         console.print(table)
 
-        log.info(f"Fallback Speed Result: DL={mbps} Mbps")
+        log.info(f"Speed Result: DL={mbps} Mbps")
 
     except ValueError:
-        log.error(f"Could not parse fallback speed value: '{result.stdout.strip()}'")
+        log.error(f"Could not parse speed value: '{result.stdout.strip()}'")
     except subprocess.TimeoutExpired:
-        log.error("Fallback speed test timed out")
+        log.error("Speed test timed out after 20s")
     except Exception as e:
-        log.error(f"Fallback speed test failed: {e}")
-
-
-def _is_apple_cdn_reachable():
-    """Quick pre-check for Apple CDN availability."""
-    try:
-        result = subprocess.run(
-            [
-                "curl",
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--max-time",
-                "5",
-                APPLE_CDN_URL,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=7,
-        )
-        return result.returncode == 0 and result.stdout.strip() == "200"
-    except Exception:
-        return False
-
-
-def check_speed_live():
-    """Run speed test with CDN pre-check and guaranteed fallback."""
-    log.info("Running live speed test...")
-
-    if _is_apple_cdn_reachable():
-        log.debug("Apple CDN reachable, using networkQuality")
-        if _check_speed_apple():
-            return  # Success, done
-        log.warning("Apple CDN was reachable but networkQuality failed, falling back")
-    else:
-        log.info("Apple CDN unreachable (pre-check), skipping networkQuality")
-
-    # Guaranteed fallback
-    _check_speed_fallback()
+        log.error(f"Speed test failed: {e}")
 
 
 def apply_fix(issue_type):
@@ -272,31 +184,27 @@ def main():
     )
 
     consecutive_failures = 0
-    auto_fix_paused = False  # NEW: tracks if auto-fix is truly paused after max retries
+    auto_fix_paused = False
     last_fix_time = 0
     last_speed_check = 0
 
     while True:
         current_time = time.time()
 
-        # Cooldown period after applying a fix
         if current_time - last_fix_time < COOLDOWN_PERIOD:
             remaining = int(COOLDOWN_PERIOD - (current_time - last_fix_time))
             console.print(f"[dim]Stabilizing... {remaining}s[/dim]", end="\r")
             time.sleep(1)
             continue
 
-        # Periodic speed test
         if current_time - last_speed_check > SPEED_CHECK_INTERVAL:
             check_speed_live()
             last_speed_check = current_time
 
-        # Health check
         is_healthy, status = check_health_scutil()
 
         if is_healthy:
             console.print("[green]✓[/green] Network Healthy", end="\r")
-            # Reset failure state only when network actually recovers
             if consecutive_failures > 0 or auto_fix_paused:
                 log.info(
                     f"Network recovered after {consecutive_failures} failure(s). "
@@ -310,7 +218,6 @@ def main():
             consecutive_failures += 1
 
             if auto_fix_paused:
-                # Do not apply more fixes — wait for manual recovery
                 log.error(
                     f"Auto-fix paused. Still seeing '{status}'. "
                     "Manual intervention required. Will resume once network recovers."
@@ -322,7 +229,6 @@ def main():
                 apply_fix(status)
                 last_fix_time = time.time()
             else:
-                # Max retries hit — pause auto-fix until recovery
                 log.error(
                     f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
                     "Pausing auto-fix until network recovers. Manual intervention required."
