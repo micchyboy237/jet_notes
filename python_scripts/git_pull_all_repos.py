@@ -47,7 +47,7 @@ from rich.table import Table
 console = Console()
 
 DEFAULT_SHALLOW_SINCE = "1 year ago"
-DEFAULT_FETCH_TIMEOUT = 20  # seconds
+DEFAULT_FETCH_TIMEOUT = 30  # seconds
 
 
 def _check_shallow_boundary(
