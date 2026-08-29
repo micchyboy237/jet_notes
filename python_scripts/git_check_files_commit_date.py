@@ -190,7 +190,6 @@ def main():
 
     for idx, rel_path in enumerate(sorted(tracked_files), start=1):
         info: Optional[dict] = None
-        source = ""
 
         # Update progress bar
         short_name = Path(rel_path).name
@@ -201,21 +200,17 @@ def main():
             info = _github_api_get_file_commit_date(owner_repo, rel_path, github_token)
             if info:
                 api_calls += 1
-                source = "api"
             else:
                 # Fallback: local git (will show shallow commit date)
                 info = _get_local_file_commit_info(repo_root, rel_path)
                 if info:
                     local_fallbacks += 1
-                    source = "local-fallback"
                 else:
                     failures += 1
         else:
             # Non-shallow: local git log is accurate
             info = _get_local_file_commit_info(repo_root, rel_path)
-            if info:
-                source = "local"
-            else:
+            if not info:
                 failures += 1
 
         if info:
@@ -239,10 +234,13 @@ def main():
         print(
             f"Mode: GitHub API ({api_calls} calls) + local fallback ({local_fallbacks}) + failures ({failures})"
         )
-        if not github_token:
+        # Only suggest token when actually approaching rate limit
+        if api_calls >= 50 and not github_token:
+            remaining = 60 - api_calls
             print(
-                "💡 Tip: Set GITHUB_TOKEN env var to increase API rate limit (60→5000/hr)"
+                f"⚠️  Approaching unauthenticated rate limit ({remaining} requests left this hour)"
             )
+            print("   Set GITHUB_TOKEN env var to increase to 5,000/hr if needed")
     else:
         print(f"Mode: Local git log ({len(results)} files, {failures} failures)")
 
