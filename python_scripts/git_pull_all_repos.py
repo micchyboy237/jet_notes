@@ -47,6 +47,7 @@ from rich.table import Table
 console = Console()
 
 DEFAULT_SHALLOW_SINCE = "1 year ago"
+DEFAULT_FETCH_TIMEOUT = 20  # seconds
 
 
 def _check_shallow_boundary(
@@ -112,12 +113,18 @@ def _check_shallow_boundary(
 def run_git_pull(
     repo_path: Path,
     shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
+    fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
     """Execute git pull with automatic fast-forward/force-push recovery.
     Handles stale .git lock files by removing them once.
     Timeouts and network errors are recorded as 'failed' and move on immediately.
     Detached HEAD repos fall back to origin/HEAD or skip merge gracefully.
-    Returns (status, message, shallow_status_dict).
+    Args:
+        repo_path: Path to the git repository.
+        shallow_since: Date string for --shallow-since or None for full history.
+        fetch_timeout: Max seconds for git fetch (default: 30).
+    Returns:
+        (status, message, shallow_status_dict).
     """
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if shallow_since:
@@ -125,10 +132,10 @@ def run_git_pull(
 
     try:
         subprocess.run(
-            fetch_cmd, capture_output=True, text=True, timeout=120, check=True
+            fetch_cmd, capture_output=True, text=True, timeout=fetch_timeout, check=True
         )
     except subprocess.TimeoutExpired:
-        return "failed", "Fetch timed out after 120s", None
+        return "failed", f"Fetch timed out after {fetch_timeout}s", None
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.strip()
         # Handle stale lock file once
@@ -140,13 +147,12 @@ def run_git_pull(
                     console.print(
                         f" [green]✓[/green] [dim]Removed stale lock file[/dim]"
                     )
-                    # Single retry after lock cleanup only
                     try:
                         subprocess.run(
                             fetch_cmd,
                             capture_output=True,
                             text=True,
-                            timeout=120,
+                            timeout=fetch_timeout,
                             check=True,
                         )
                     except Exception as retry_err:
@@ -245,7 +251,6 @@ def run_git_pull(
                 f"Merge conflict on branch '{branch}': {merge_stderr[:300]}",
                 None,
             )
-        # Non-conflict merge failure falls through to hard reset
 
     # Hard reset fallback for force-pushed branches
     try:
