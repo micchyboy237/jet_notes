@@ -1,11 +1,14 @@
 import logging
 import os
 import random
+import select
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
+import tty
 from collections import deque
 
 from rich.console import Console
@@ -73,6 +76,10 @@ if not log.handlers:
 _last_health_status = None
 _last_debug_log_time = 0
 _speed_history = deque(maxlen=SPEED_ROLLING_WINDOW)  # Rolling speed samples
+
+# Manual trigger state (thread-safe via GIL for simple bool,
+# but logically separated for clarity)
+_manual_speed_test_requested = False
 
 
 def require_root():
@@ -415,12 +422,56 @@ def apply_fix(issue_type):
         return False
 
 
+def _input_listener(stop_event):
+    """
+    Non-blocking keyboard listener thread.
+    Watches for 'r' keypress to trigger manual speed test.
+    Uses select() for non-blocking I/O on Unix/macOS.
+    """
+    global _manual_speed_test_requested
+
+    # Save original terminal settings to restore later
+    try:
+        old_settings = termios.tcgetattr(sys.stdin)
+        # Set raw mode: disable echo, canonical processing, signals
+        tty.setraw(sys.stdin.fileno())
+    except (termios.error, ValueError):
+        # Not a TTY (e.g., piped input), skip keyboard listening
+        log.debug("Stdin is not a TTY; keyboard listener disabled")
+        return
+
+    try:
+        while not stop_event.is_set():
+            # Non-blocking check: wait up to 0.2s for input
+            ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            if ready:
+                try:
+                    ch = sys.stdin.read(1)
+                    if ch.lower() == "r":
+                        _manual_speed_test_requested = True
+                        # Visual feedback that keypress was received
+                        console.print(
+                            "\n[bold yellow]⌨ 'r' pressed — triggering manual speed test...[/bold yellow]"
+                        )
+                        log.info("Manual speed test requested via keyboard")
+                except Exception:
+                    pass
+    finally:
+        # CRITICAL: Always restore terminal settings
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        except Exception:
+            pass
+
+
 def main():
+    global _manual_speed_test_requested
+
     require_root()
 
     console.print(
         Panel.fit(
-            "[bold blue]Network Guardian Fast[/bold blue]\nReal-time scutil monitoring",
+            "[bold blue]Network Guardian Fast[/bold blue]\nReal-time scutil monitoring\n[dim]Press 'r' for manual speed test[/dim]",
             border_style="blue",
         )
     )
@@ -434,91 +485,118 @@ def main():
         f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
     )
 
+    # Start non-blocking keyboard listener
+    input_stop_event = threading.Event()
+    input_thread = threading.Thread(
+        target=_input_listener,
+        args=(input_stop_event,),
+        daemon=True,
+        name="KeyboardListener",
+    )
+    input_thread.start()
+    log.debug("Keyboard listener thread started")
+
     consecutive_failures = 0
     auto_fix_paused = False
     last_fix_time = 0
     last_speed_check = 0
 
-    while True:
-        current_time = time.time()
+    try:
+        while True:
+            current_time = time.time()
 
-        # Cooldown period after applying a fix
-        if current_time - last_fix_time < COOLDOWN_PERIOD:
-            remaining = int(COOLDOWN_PERIOD - (current_time - last_fix_time))
-            console.print(f"[dim]Stabilizing... {remaining}s[/dim]", end="\r")
-            time.sleep(1)
-            continue
+            # Cooldown period after applying a fix
+            if current_time - last_fix_time < COOLDOWN_PERIOD:
+                remaining = int(COOLDOWN_PERIOD - (current_time - last_fix_time))
+                console.print(f"[dim]Stabilizing... {remaining}s[/dim]", end="\r")
+                time.sleep(1)
+                continue
 
-        # Periodic speed test with countdown
-        time_since_last_speed = current_time - last_speed_check
-        if time_since_last_speed >= SPEED_CHECK_INTERVAL:
-            check_speed_live()
-            last_speed_check = time.time()
-        else:
-            # Display live countdown until next speed test
-            remaining = int(SPEED_CHECK_INTERVAL - time_since_last_speed)
-            console.print(
-                f"[dim]Next speed test in: {remaining}s[/dim]      ", end="\r"
-            )
-
-        # Health check (L3/L4 layer)
-        is_healthy, status = check_health_scutil()
-
-        # Check rolling average for speed degradation even when L3/L4 is healthy
-        avg_speed = get_average_speed()
-        if (
-            is_healthy
-            and avg_speed is not None
-            and avg_speed < SPEED_DEGRADED_THRESHOLD
-        ):
-            is_healthy = False
-            status = "Speed Degraded"
-            log.warning(
-                f"L3/L4 healthy but rolling avg speed degraded: "
-                f"{avg_speed} Mbps (window={len(_speed_history)}) "
-                f"< {SPEED_DEGRADED_THRESHOLD} Mbps"
-            )
-
-        if is_healthy:
-            console.print("[green]✓[/green] Network Healthy", end="\r")
-            if consecutive_failures > 0 or auto_fix_paused:
-                log.info(
-                    f"Network recovered after {consecutive_failures} failure(s). "
-                    "Resuming auto-fix."
-                )
-            consecutive_failures = 0
-            auto_fix_paused = False
-        else:
-            console.print(f"\n[red]✗[/red] {status}")
-            log.warning(f"Health check failed: {status}")
-            consecutive_failures += 1
-
-            if auto_fix_paused:
-                log.error(
-                    f"Auto-fix paused. Still seeing '{status}'. "
-                    "Manual intervention required. Will resume once network recovers."
-                )
-            elif consecutive_failures <= MAX_RETRIES:
-                log.info(
-                    f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
-                )
-
-                fix_succeeded = apply_fix(status)
-                last_fix_time = time.time()
-
-                if not fix_succeeded:
-                    log.warning(
-                        f"Fix for '{status}' reported failure. "
-                        f"Counting as attempt {consecutive_failures}/{MAX_RETRIES}."
-                    )
+            # Check for manual speed test trigger FIRST (non-blocking)
+            if _manual_speed_test_requested:
+                _manual_speed_test_requested = False
+                log.info("Executing manual speed test (triggered by 'r' key)")
+                check_speed_live()
+                # Reset auto-timer so we don't double-test right after manual
+                last_speed_check = time.time()
             else:
-                log.error(
-                    f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
-                    "Pausing auto-fix until network recovers. Manual intervention required."
-                )
-                auto_fix_paused = True
+                # Periodic speed test with countdown
+                time_since_last_speed = current_time - last_speed_check
+                if time_since_last_speed >= SPEED_CHECK_INTERVAL:
+                    check_speed_live()
+                    last_speed_check = time.time()
+                else:
+                    # Display live countdown until next speed test
+                    remaining = int(SPEED_CHECK_INTERVAL - time_since_last_speed)
+                    console.print(
+                        f"[dim]Next speed test in: {remaining}s | Press 'r' for manual[/dim]      ",
+                        end="\r",
+                    )
 
-        time.sleep(CHECK_INTERVAL)
+            # Health check (L3/L4 layer)
+            is_healthy, status = check_health_scutil()
+
+            # Check rolling average for speed degradation even when L3/L4 is healthy
+            avg_speed = get_average_speed()
+            if (
+                is_healthy
+                and avg_speed is not None
+                and avg_speed < SPEED_DEGRADED_THRESHOLD
+            ):
+                is_healthy = False
+                status = "Speed Degraded"
+                log.warning(
+                    f"L3/L4 healthy but rolling avg speed degraded: "
+                    f"{avg_speed} Mbps (window={len(_speed_history)}) "
+                    f"< {SPEED_DEGRADED_THRESHOLD} Mbps"
+                )
+
+            if is_healthy:
+                console.print("[green]✓[/green] Network Healthy", end="\r")
+                if consecutive_failures > 0 or auto_fix_paused:
+                    log.info(
+                        f"Network recovered after {consecutive_failures} failure(s). "
+                        "Resuming auto-fix."
+                    )
+                consecutive_failures = 0
+                auto_fix_paused = False
+            else:
+                console.print(f"\n[red]✗[/red] {status}")
+                log.warning(f"Health check failed: {status}")
+                consecutive_failures += 1
+
+                if auto_fix_paused:
+                    log.error(
+                        f"Auto-fix paused. Still seeing '{status}'. "
+                        "Manual intervention required. Will resume once network recovers."
+                    )
+                elif consecutive_failures <= MAX_RETRIES:
+                    log.info(
+                        f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
+                    )
+
+                    fix_succeeded = apply_fix(status)
+                    last_fix_time = time.time()
+
+                    if not fix_succeeded:
+                        log.warning(
+                            f"Fix for '{status}' reported failure. "
+                            f"Counting as attempt {consecutive_failures}/{MAX_RETRIES}."
+                        )
+                else:
+                    log.error(
+                        f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
+                        "Pausing auto-fix until network recovers. Manual intervention required."
+                    )
+                    auto_fix_paused = True
+
+            time.sleep(CHECK_INTERVAL)
+
+    finally:
+        # Clean up keyboard listener
+        input_stop_event.set()
+        input_thread.join(timeout=2)
+        log.debug("Keyboard listener thread stopped")
 
 
 if __name__ == "__main__":
