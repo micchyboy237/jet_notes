@@ -34,8 +34,8 @@ LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
 
 # Speed test configuration
-SPEED_TEST_BYTES_NORMAL = 500_000  # 0.5MB for healthy connections
-SPEED_TEST_BYTES_DEGRADED = 250_000  # 0.25MB for degraded connections (adaptive)
+SPEED_TEST_BYTES_NORMAL = 2_000_000  # 2.0MB for healthy connections
+SPEED_TEST_BYTES_DEGRADED = 500_000  # 0.5MB for degraded connections (adaptive)
 SPEED_DEGRADED_THRESHOLD = 0.3  # Mbps threshold to trigger degraded mode + fix
 SPEED_TEST_PROGRESS_INTERVAL = 0.5
 SPEED_TEST_URL_TEMPLATE = "https://speed.cloudflare.com/__down?bytes={}"
