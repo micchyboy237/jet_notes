@@ -1,3 +1,28 @@
+"""
+git_pull_all_repos.py – Safely pull all Git repositories under a directory.
+
+Features:
+  • Preserves local changes: repos with uncommitted modifications are skipped
+    instead of being hard-reset, preventing accidental data loss.
+  • Resumable: state is saved after every repo; use --continue after Ctrl+C.
+  • Retry failed: use --only-failed to retry only previously failed repos.
+  • Shallow or full history fetch (--no-depth for full clone history).
+  • Sort by .git size to prioritize small/large repos.
+
+Usage examples:
+  # Pull all repos (shallow, depth=1) with local-change protection
+  python git_pull_all_repos.py /path/to/repos
+
+  # Resume after interruption
+  python git_pull_all_repos.py /path/to/repos --continue
+
+  # Retry only failed repos from last run
+  python git_pull_all_repos.py /path/to/repos --only-failed
+
+  # Full history fetch, sorted largest-first, custom state file
+  python git_pull_all_repos.py /path/to/repos --no-depth -s desc -o state.json
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -27,11 +52,29 @@ DEFAULT_DEPTH = 1
 def run_git_pull(
     repo_path: Path,
     depth: int | None = DEFAULT_DEPTH,
-) -> tuple[Literal["success", "up-to-date", "failed", "error"], str]:
+) -> tuple[Literal["success", "up-to-date", "failed", "error", "skipped"], str]:
     """Execute git pull with automatic fast-forward/force-push recovery.
 
     Handles stale .git lock files by removing them and retrying once.
+    Skips repositories with uncommitted local changes to prevent data loss.
     """
+    # ✅ Guard: skip repos with uncommitted changes to preserve manual edits
+    try:
+        status_result = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        if status_result.stdout.strip():
+            return (
+                "skipped",
+                "Local changes detected; skipping to preserve manual edits",
+            )
+    except Exception as e:
+        return "error", f"Could not check working tree: {e}"
+
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if depth is not None:
         fetch_cmd.extend(["--depth", str(depth)])
@@ -106,6 +149,7 @@ def run_git_pull(
             return "up-to-date", result.stdout.strip()
         return "success", result.stdout.strip()
     except subprocess.CalledProcessError:
+        # Only hard-reset if working tree was clean at entry (guaranteed by guard above)
         try:
             subprocess.run(
                 ["git", "-C", str(repo_path), "reset", "--hard", f"origin/{branch}"],
@@ -158,7 +202,7 @@ def _build_state(
     final_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
-        for status in ["success", "up-to-date", "failed", "error"]:
+        for status in ["success", "up-to-date", "failed", "error", "skipped"]:
             final_stats[status] = final_stats.get(status, 0) + prev_summary.get(
                 status, {}
             ).get("count", 0)
@@ -182,6 +226,7 @@ def _build_state(
         "up-to-date": [],
         "failed": [],
         "error": [],
+        "skipped": [],
     }
     if previous_state:
         for k in final_grouped:
@@ -238,6 +283,7 @@ def _status_label(status: str) -> str:
         "up-to-date": "[blue]→ Up to date[/blue]",
         "failed": "[red]✗ Failed[/red]",
         "error": "[red bold]! Error[/red bold]",
+        "skipped": "[yellow]⊘ Skipped (local changes)[/yellow]",
     }
     return labels.get(status, status)
 
@@ -253,6 +299,7 @@ def git_pull_all_repos(
     """
     Find all git repositories under target_dir and run `git pull` in each.
     Now properly handles state merging for --continue and --only-failed.
+    Repos with uncommitted local changes are safely skipped.
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
@@ -350,6 +397,7 @@ def git_pull_all_repos(
         "up-to-date": [],
         "failed": [],
         "error": [],
+        "skipped": [],
     }
     failed_entries: list[dict[str, str]] = []
     skipped_no_remote: list[str] = []
@@ -361,7 +409,13 @@ def git_pull_all_repos(
             grouped_results=grouped_results,
             failed_entries=failed_entries,
             skipped_no_remote=skipped_no_remote,
-            stats={"success": 0, "up-to-date": 0, "failed": 0, "error": 0},
+            stats={
+                "success": 0,
+                "up-to-date": 0,
+                "failed": 0,
+                "error": 0,
+                "skipped": 0,
+            },
             total=grand_total,
             target_dir=target_dir_str,
             depth=depth,
@@ -379,7 +433,7 @@ def git_pull_all_repos(
         f"(Grand total: {grand_total})[/bold]\n"
     )
 
-    stats = {"success": 0, "up-to-date": 0, "failed": 0, "error": 0}
+    stats = {"success": 0, "up-to-date": 0, "failed": 0, "error": 0, "skipped": 0}
 
     def save_state(completed: bool = False) -> None:
         """Save complete state to single JSON file."""
@@ -445,6 +499,7 @@ def git_pull_all_repos(
                 "up-to-date": "[blue]→[/blue]",
                 "failed": "[red]✗[/red]",
                 "error": "[red bold]![/red bold]",
+                "skipped": "[yellow]⊘[/yellow]",
             }[status]
 
             console.print(
@@ -458,7 +513,7 @@ def git_pull_all_repos(
     merged_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
-        for status in ["success", "up-to-date", "failed", "error"]:
+        for status in ["success", "up-to-date", "failed", "error", "skipped"]:
             merged_stats[status] = merged_stats.get(status, 0) + prev_summary.get(
                 status, {}
             ).get("count", 0)
@@ -482,7 +537,7 @@ def git_pull_all_repos(
         table.add_column("Count", justify="right")
         table.add_column("Percentage", justify="right")
 
-        status_order = ["success", "up-to-date", "failed", "error"]
+        status_order = ["success", "up-to-date", "skipped", "failed", "error"]
         for status in status_order:
             count = stats.get(status, 0)
             perc = (count / total_this_run * 100) if total_this_run > 0 else 0
