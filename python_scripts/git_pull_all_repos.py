@@ -114,69 +114,97 @@ def run_git_pull(
     shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
     """Execute git pull with automatic fast-forward/force-push recovery.
-    Handles stale .git lock files by removing them and retrying once.
-    Merge conflicts are caught and returned as 'error' status.
-    Uses --shallow-since for time-based shallow fetching when configured.
+    Handles stale .git lock files by removing them once.
+    Timeouts and network errors are recorded as 'failed' and move on immediately.
+    Detached HEAD repos fall back to origin/HEAD or skip merge gracefully.
     Returns (status, message, shallow_status_dict).
     """
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if shallow_since:
         fetch_cmd.extend(["--shallow-since", shallow_since])
 
-    max_retries = 1
-    for attempt in range(max_retries + 1):
-        try:
-            subprocess.run(
-                fetch_cmd, capture_output=True, text=True, timeout=120, check=True
-            )
-            break
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.strip()
-            if "Unable to create" in stderr and ".git/shallow.lock" in stderr:
-                lock_path = repo_path / ".git" / "shallow.lock"
-                console.print(
-                    f" [yellow]⚠[/yellow] [dim]Lock file detected: {lock_path}[/dim]"
-                )
-                if lock_path.exists():
-                    try:
-                        lock_path.unlink()
-                        console.print(
-                            f" [green]✓[/green] [dim]Removed stale lock file[/dim]"
-                        )
-                    except OSError as unlink_error:
-                        console.print(
-                            f" [red]✗[/red] [dim]Failed to remove lock: {unlink_error}[/dim]"
-                        )
-                        return "failed", f"Fetch failed: {stderr}", None
-                else:
-                    console.print(
-                        f" [yellow]⚠[/yellow] [dim]Lock file not found on disk, "
-                        f"another process may be running[/dim]"
-                    )
-                    return "failed", f"Fetch failed: {stderr}", None
-                if attempt < max_retries:
-                    console.print(f" [dim]Retrying fetch...[/dim]")
-                    continue
-                else:
-                    return (
-                        "failed",
-                        f"Fetch failed after lock cleanup: {stderr}",
-                        None,
-                    )
-            return "failed", f"Fetch failed: {stderr}", None
-
     try:
-        branch = subprocess.run(
+        subprocess.run(
+            fetch_cmd, capture_output=True, text=True, timeout=120, check=True
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", "Fetch timed out after 120s", None
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip()
+        # Handle stale lock file once
+        if "Unable to create" in stderr and ".git/shallow.lock" in stderr:
+            lock_path = repo_path / ".git" / "shallow.lock"
+            if lock_path.exists():
+                try:
+                    lock_path.unlink()
+                    console.print(
+                        f" [green]✓[/green] [dim]Removed stale lock file[/dim]"
+                    )
+                    # Single retry after lock cleanup only
+                    try:
+                        subprocess.run(
+                            fetch_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                            check=True,
+                        )
+                    except Exception as retry_err:
+                        return (
+                            "failed",
+                            f"Fetch failed after lock cleanup: {retry_err}",
+                            None,
+                        )
+                except OSError as unlink_error:
+                    return "failed", f"Failed to remove lock: {unlink_error}", None
+            else:
+                return "failed", f"Fetch failed: {stderr}", None
+        return "failed", f"Fetch failed: {stderr}", None
+    except Exception as e:
+        return "failed", f"Fetch exception: {e}", None
+
+    # Determine branch with detached HEAD fallback
+    branch = None
+    try:
+        result = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=10,
             check=True,
-        ).stdout.strip()
+        )
+        branch = result.stdout.strip()
+        if branch == "HEAD":
+            branch = None
     except Exception:
-        return "failed", "Could not determine current branch", None
+        pass
 
-    # Attempt fast-forward merge first
+    if not branch:
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "symbolic-ref",
+                    "--short",
+                    "refs/remotes/origin/HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+            branch = result.stdout.strip().replace("origin/", "")
+        except Exception:
+            shallow_status = _check_shallow_boundary(repo_path, "HEAD", shallow_since)
+            return (
+                "success",
+                "Fetched successfully (detached HEAD, no merge attempted)",
+                shallow_status,
+            )
+
+    # Fast-forward merge
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "merge", "--ff-only", f"origin/{branch}"],
@@ -192,7 +220,6 @@ def run_git_pull(
         return "success", result.stdout.strip(), shallow_status
     except subprocess.CalledProcessError as merge_err:
         merge_stderr = merge_err.stderr.strip()
-        # Detect merge conflict vs other merge failures
         conflict_indicators = (
             "CONFLICT",
             "Automatic merge failed",
@@ -202,9 +229,7 @@ def run_git_pull(
         is_conflict = any(
             ind.lower() in merge_stderr.lower() for ind in conflict_indicators
         )
-
         if is_conflict:
-            # Abort the conflicted merge to leave working tree clean
             try:
                 subprocess.run(
                     ["git", "-C", str(repo_path), "merge", "--abort"],
@@ -220,12 +245,9 @@ def run_git_pull(
                 f"Merge conflict on branch '{branch}': {merge_stderr[:300]}",
                 None,
             )
+        # Non-conflict merge failure falls through to hard reset
 
-        # Non-conflict merge failure (e.g., diverged history without ff-only)
-        # Fall through to hard reset as force-push recovery
-        pass
-
-    # Force-push recovery via hard reset
+    # Hard reset fallback for force-pushed branches
     try:
         subprocess.run(
             ["git", "-C", str(repo_path), "reset", "--hard", f"origin/{branch}"],
@@ -235,11 +257,7 @@ def run_git_pull(
             check=True,
         )
         shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
-        return (
-            "success",
-            "Hard reset to origin (force-push recovery)",
-            shallow_status,
-        )
+        return "success", "Hard reset to origin (force-push recovery)", shallow_status
     except subprocess.CalledProcessError as e:
         return "failed", f"Reset failed: {e.stderr.strip()}", None
     except Exception as e:
