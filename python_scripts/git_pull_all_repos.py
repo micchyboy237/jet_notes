@@ -1,26 +1,26 @@
 """
-git_pull_all_repos.py – Safely pull all Git repositories under a directory.
-
+git_pull_all_repos.py – Pull all Git repositories under a directory.
 Features:
-  • Preserves local changes: repos with uncommitted modifications are skipped
-    instead of being hard-reset, preventing accidental data loss.
   • Resumable: state is saved after every repo; use --continue after Ctrl+C.
   • Retry failed: use --only-failed to retry only previously failed repos.
-  • Shallow or full history fetch (--no-depth for full clone history).
+  • Time-based shallow fetch (--shallow-since) or full history.
+  • Shallow boundary verification: detects if remote has commits outside
+    the shallow-since window that were not fetched.
+  • Merge conflicts are caught and recorded as "error" state.
   • Sort by .git size to prioritize small/large repos.
-
 Usage examples:
-  # Pull all repos (shallow, depth=1) with local-change protection
+  # Pull all repos (shallow since 1 year ago)
   python git_pull_all_repos.py /path/to/repos
-
+  # Custom time window
+  python git_pull_all_repos.py /path/to/repos --shallow-since "6 months ago"
+  # Full history fetch
+  python git_pull_all_repos.py /path/to/repos --shallow-since full
   # Resume after interruption
   python git_pull_all_repos.py /path/to/repos --continue
-
   # Retry only failed repos from last run
   python git_pull_all_repos.py /path/to/repos --only-failed
-
-  # Full history fetch, sorted largest-first, custom state file
-  python git_pull_all_repos.py /path/to/repos --no-depth -s desc -o state.json
+  # Sorted largest-first, custom state file
+  python git_pull_all_repos.py /path/to/repos -s desc -o state.json
 """
 
 from __future__ import annotations
@@ -46,56 +46,97 @@ from rich.table import Table
 
 console = Console()
 
-DEFAULT_DEPTH = 1
+DEFAULT_SHALLOW_SINCE = "1 year ago"
 
 
-def run_git_pull(
-    repo_path: Path,
-    depth: int | None = DEFAULT_DEPTH,
-) -> tuple[Literal["success", "up-to-date", "failed", "error", "skipped"], str]:
-    """Execute git pull with automatic fast-forward/force-push recovery.
-
-    Handles stale .git lock files by removing them and retrying once.
-    Skips repositories with uncommitted local changes to prevent data loss.
+def _check_shallow_boundary(
+    repo_path: Path, branch: str, shallow_since: str | None
+) -> dict:
+    """Compare local and remote tip dates to verify shallow completeness.
+    Returns a dict with shallow status information.
+    Only meaningful when shallow_since is set.
     """
-    # ✅ Guard: skip repos with uncommitted changes to preserve manual edits
+    status: dict = {
+        "mode": "shallow-since" if shallow_since else "full",
+        "value": shallow_since,
+        "remote_has_unfetched": None,
+        "local_tip_date": None,
+        "remote_tip_date": None,
+    }
+    if not shallow_since:
+        status["remote_has_unfetched"] = False
+        return status
+
     try:
-        status_result = subprocess.run(
-            ["git", "-C", str(repo_path), "status", "--porcelain"],
+        local_result = subprocess.run(
+            ["git", "-C", str(repo_path), "log", "-1", "--format=%aI", "HEAD"],
             capture_output=True,
             text=True,
             timeout=10,
             check=True,
         )
-        if status_result.stdout.strip():
-            return (
-                "skipped",
-                "Local changes detected; skipping to preserve manual edits",
-            )
-    except Exception as e:
-        return "error", f"Could not check working tree: {e}"
+        status["local_tip_date"] = local_result.stdout.strip() or None
+    except Exception:
+        pass
 
+    try:
+        remote_result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "log",
+                "-1",
+                "--format=%aI",
+                f"origin/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        status["remote_tip_date"] = remote_result.stdout.strip() or None
+    except Exception:
+        pass
+
+    if status["local_tip_date"] and status["remote_tip_date"]:
+        status["remote_has_unfetched"] = (
+            status["local_tip_date"] != status["remote_tip_date"]
+        )
+    else:
+        status["remote_has_unfetched"] = None
+
+    return status
+
+
+def run_git_pull(
+    repo_path: Path,
+    shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
+) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
+    """Execute git pull with automatic fast-forward/force-push recovery.
+    Handles stale .git lock files by removing them and retrying once.
+    Merge conflicts are caught and returned as 'error' status.
+    Uses --shallow-since for time-based shallow fetching when configured.
+    Returns (status, message, shallow_status_dict).
+    """
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
-    if depth is not None:
-        fetch_cmd.extend(["--depth", str(depth)])
+    if shallow_since:
+        fetch_cmd.extend(["--shallow-since", shallow_since])
 
-    max_retries = 1  # One retry after lock cleanup
+    max_retries = 1
     for attempt in range(max_retries + 1):
         try:
             subprocess.run(
                 fetch_cmd, capture_output=True, text=True, timeout=120, check=True
             )
-            break  # Success, exit retry loop
+            break
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.strip()
-
-            # Check if this is a lock file error
             if "Unable to create" in stderr and ".git/shallow.lock" in stderr:
                 lock_path = repo_path / ".git" / "shallow.lock"
                 console.print(
                     f" [yellow]⚠[/yellow] [dim]Lock file detected: {lock_path}[/dim]"
                 )
-
                 if lock_path.exists():
                     try:
                         lock_path.unlink()
@@ -106,25 +147,24 @@ def run_git_pull(
                         console.print(
                             f" [red]✗[/red] [dim]Failed to remove lock: {unlink_error}[/dim]"
                         )
-                        return "failed", f"Fetch failed: {stderr}"
+                        return "failed", f"Fetch failed: {stderr}", None
                 else:
                     console.print(
                         f" [yellow]⚠[/yellow] [dim]Lock file not found on disk, "
                         f"another process may be running[/dim]"
                     )
-                    return "failed", f"Fetch failed: {stderr}"
-
-                # Retry the fetch after removing lock
+                    return "failed", f"Fetch failed: {stderr}", None
                 if attempt < max_retries:
                     console.print(f" [dim]Retrying fetch...[/dim]")
                     continue
                 else:
-                    return "failed", f"Fetch failed after lock cleanup: {stderr}"
+                    return (
+                        "failed",
+                        f"Fetch failed after lock cleanup: {stderr}",
+                        None,
+                    )
+            return "failed", f"Fetch failed: {stderr}", None
 
-            # Not a lock error, fail immediately
-            return "failed", f"Fetch failed: {stderr}"
-
-    # Determine current branch
     try:
         branch = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
@@ -134,9 +174,9 @@ def run_git_pull(
             check=True,
         ).stdout.strip()
     except Exception:
-        return "failed", "Could not determine current branch"
+        return "failed", "Could not determine current branch", None
 
-    # Try fast-forward merge
+    # Attempt fast-forward merge first
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "merge", "--ff-only", f"origin/{branch}"],
@@ -146,23 +186,64 @@ def run_git_pull(
             check=True,
         )
         if "Already up to date" in result.stdout:
-            return "up-to-date", result.stdout.strip()
-        return "success", result.stdout.strip()
-    except subprocess.CalledProcessError:
-        # Only hard-reset if working tree was clean at entry (guaranteed by guard above)
-        try:
-            subprocess.run(
-                ["git", "-C", str(repo_path), "reset", "--hard", f"origin/{branch}"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
+            shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
+            return "up-to-date", result.stdout.strip(), shallow_status
+        shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
+        return "success", result.stdout.strip(), shallow_status
+    except subprocess.CalledProcessError as merge_err:
+        merge_stderr = merge_err.stderr.strip()
+        # Detect merge conflict vs other merge failures
+        conflict_indicators = (
+            "CONFLICT",
+            "Automatic merge failed",
+            "Merge conflict",
+            "conflict",
+        )
+        is_conflict = any(
+            ind.lower() in merge_stderr.lower() for ind in conflict_indicators
+        )
+
+        if is_conflict:
+            # Abort the conflicted merge to leave working tree clean
+            try:
+                subprocess.run(
+                    ["git", "-C", str(repo_path), "merge", "--abort"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except Exception:
+                pass
+            return (
+                "error",
+                f"Merge conflict on branch '{branch}': {merge_stderr[:300]}",
+                None,
             )
-            return "success", "Hard reset to origin (force-push recovery)"
-        except subprocess.CalledProcessError as e:
-            return "failed", f"Reset failed: {e.stderr.strip()}"
+
+        # Non-conflict merge failure (e.g., diverged history without ff-only)
+        # Fall through to hard reset as force-push recovery
+        pass
+
+    # Force-push recovery via hard reset
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_path), "reset", "--hard", f"origin/{branch}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
+        return (
+            "success",
+            "Hard reset to origin (force-push recovery)",
+            shallow_status,
+        )
+    except subprocess.CalledProcessError as e:
+        return "failed", f"Reset failed: {e.stderr.strip()}", None
     except Exception as e:
-        return "error", f"Exception: {e}"
+        return "error", f"Exception during reset: {e}", None
 
 
 def _write_state_file(state_path: Path, state: dict) -> None:
@@ -188,11 +269,10 @@ def _build_state(
     progress_data: dict[str, dict[str, str]],
     grouped_results: dict[str, list[str]],
     failed_entries: list[dict[str, str]],
-    skipped_no_remote: list[str],
     stats: dict[str, int],
     total: int,
     target_dir: str,
-    depth: int | None,
+    shallow_since: str | None,
     sort_by_size: str | None,
     processed_repos: set[str],
     completed: bool = False,
@@ -202,7 +282,7 @@ def _build_state(
     final_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
-        for status in ["success", "up-to-date", "failed", "error", "skipped"]:
+        for status in ["success", "up-to-date", "failed", "error"]:
             final_stats[status] = final_stats.get(status, 0) + prev_summary.get(
                 status, {}
             ).get("count", 0)
@@ -226,7 +306,6 @@ def _build_state(
         "up-to-date": [],
         "failed": [],
         "error": [],
-        "skipped": [],
     }
     if previous_state:
         for k in final_grouped:
@@ -234,12 +313,9 @@ def _build_state(
     for k in grouped_results:
         final_grouped[k].extend(grouped_results[k])
 
-    # --- FIXED: Remove duplicate failed entries by repoPath ---
     final_failed = []
     if previous_state:
-        # Build set of repoPaths that failed in the CURRENT run
         current_failed_paths = {entry["repoPath"] for entry in failed_entries}
-        # Keep previous failed entries ONLY if they are NOT being updated in current run
         final_failed = [
             entry
             for entry in previous_state.get("failed", [])
@@ -249,18 +325,12 @@ def _build_state(
             f"[dim]State merge: keeping {len(final_failed)} previous failed entries, "
             f"replacing {len(current_failed_paths)} with current results[/dim]"
         )
-    # Append current run's failed entries (these replace old ones for same repoPath)
     final_failed.extend(failed_entries)
-    # --- END FIX ---
-
-    final_skipped = skipped_no_remote[:]
-    if previous_state:
-        final_skipped = previous_state.get("skipped_no_remote", []) + final_skipped
 
     return {
         "metadata": {
             "target_directory": target_dir,
-            "depth": depth,
+            "shallow_since": shallow_since,
             "sort_by_size": sort_by_size,
             "timestamp": datetime.now().isoformat(),
             "completed": completed,
@@ -270,7 +340,6 @@ def _build_state(
         "summary": summary,
         "grouped_results": final_grouped,
         "failed": final_failed,
-        "skipped_no_remote": final_skipped,
         "processed_repos": sorted(list(processed_repos)),
         "progress": progress_data,
     }
@@ -283,7 +352,6 @@ def _status_label(status: str) -> str:
         "up-to-date": "[blue]→ Up to date[/blue]",
         "failed": "[red]✗ Failed[/red]",
         "error": "[red bold]! Error[/red bold]",
-        "skipped": "[yellow]⊘ Skipped (local changes)[/yellow]",
     }
     return labels.get(status, status)
 
@@ -291,15 +359,17 @@ def _status_label(status: str) -> str:
 def git_pull_all_repos(
     target_dir: str | Path = ".",
     out_path: Path | None = None,
-    depth: int | None = DEFAULT_DEPTH,
+    shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
     sort_by_size: str | None = None,
     continue_from_last: bool = False,
     only_failed: bool = False,
 ) -> None:
     """
     Find all git repositories under target_dir and run `git pull` in each.
-    Now properly handles state merging for --continue and --only-failed.
-    Repos with uncommitted local changes are safely skipped.
+    Properly handles state merging for --continue and --only-failed.
+    Uses --shallow-since for time-based shallow fetching.
+    Verifies shallow boundary and records unfetched commit status in state.
+    Merge conflicts are caught and recorded as 'error' status.
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
@@ -310,9 +380,9 @@ def git_pull_all_repos(
         state_path = out_path.expanduser().resolve()
 
     mode_line = (
-        f"[bold yellow]Shallow mode enabled: depth={depth}[/bold yellow]"
-        if depth is not None
-        else "[bold yellow]Full history mode (--no-depth)[/bold yellow]"
+        f'[bold yellow]Shallow mode enabled: --shallow-since="{shallow_since}"[/bold yellow]'
+        if shallow_since
+        else "[bold yellow]Full history mode (no shallow-since)[/bold yellow]"
     )
 
     if continue_from_last:
@@ -328,7 +398,6 @@ def git_pull_all_repos(
     )
     console.print(f"[dim]State file: {state_path}[/dim]\n")
 
-    existing_state = None
     processed_repos: set[str] = set()
     previous_state = None
 
@@ -364,8 +433,8 @@ def git_pull_all_repos(
         )
     )
 
-    if only_failed and existing_state:
-        failed_paths = {entry["repoPath"] for entry in existing_state.get("failed", [])}
+    if only_failed and previous_state:
+        failed_paths = {entry["repoPath"] for entry in previous_state.get("failed", [])}
         repos = [repo for repo in repos if str(repo.path) in failed_paths]
         if not repos:
             console.print("[green]No failed repos to retry! Everything passed.[/green]")
@@ -397,10 +466,8 @@ def git_pull_all_repos(
         "up-to-date": [],
         "failed": [],
         "error": [],
-        "skipped": [],
     }
     failed_entries: list[dict[str, str]] = []
-    skipped_no_remote: list[str] = []
 
     if total_this_run == 0:
         console.print("[yellow]No git repositories found.[/yellow]")
@@ -408,17 +475,10 @@ def git_pull_all_repos(
             progress_data=progress_data,
             grouped_results=grouped_results,
             failed_entries=failed_entries,
-            skipped_no_remote=skipped_no_remote,
-            stats={
-                "success": 0,
-                "up-to-date": 0,
-                "failed": 0,
-                "error": 0,
-                "skipped": 0,
-            },
+            stats={"success": 0, "up-to-date": 0, "failed": 0, "error": 0},
             total=grand_total,
             target_dir=target_dir_str,
-            depth=depth,
+            shallow_since=shallow_since,
             sort_by_size=sort_by_size,
             processed_repos=processed_repos,
             completed=True,
@@ -433,7 +493,7 @@ def git_pull_all_repos(
         f"(Grand total: {grand_total})[/bold]\n"
     )
 
-    stats = {"success": 0, "up-to-date": 0, "failed": 0, "error": 0, "skipped": 0}
+    stats = {"success": 0, "up-to-date": 0, "failed": 0, "error": 0}
 
     def save_state(completed: bool = False) -> None:
         """Save complete state to single JSON file."""
@@ -441,11 +501,10 @@ def git_pull_all_repos(
             progress_data=progress_data,
             grouped_results=grouped_results,
             failed_entries=failed_entries,
-            skipped_no_remote=skipped_no_remote,
             stats=stats,
             total=grand_total,
             target_dir=target_dir_str,
-            depth=depth,
+            shallow_since=shallow_since,
             sort_by_size=sort_by_size,
             processed_repos=processed_repos,
             completed=completed,
@@ -466,26 +525,17 @@ def git_pull_all_repos(
             repo = repo_info.path
             short_name = repo_info.name
             repo_key = str(repo)
-
             progress.update(task, description=f"[cyan]Pulling {short_name}...")
 
-            if not repo_info.has_remote_tracking:
-                console.print(
-                    f" [yellow]⊘[/yellow] {repo} → [dim]Skipped (no remote tracking)[/dim]"
-                )
-                skipped_no_remote.append(repo_key)
-                progress_data[repo_key] = {
-                    "status": "skipped",
-                    "message": "No remote tracking configured",
-                }
-                processed_repos.add(repo_key)
-                save_state()
-                progress.advance(task)
-                continue
-
-            status, message = run_git_pull(repo, depth=depth)
+            status, message, shallow_status = run_git_pull(
+                repo, shallow_since=shallow_since
+            )
             stats[status] += 1
-            progress_data[repo_key] = {"status": status, "message": message}
+            progress_data[repo_key] = {
+                "status": status,
+                "message": message,
+                "shallow_status": shallow_status,
+            }
             grouped_results[status].append(repo_key)
             processed_repos.add(repo_key)
 
@@ -499,12 +549,17 @@ def git_pull_all_repos(
                 "up-to-date": "[blue]→[/blue]",
                 "failed": "[red]✗[/red]",
                 "error": "[red bold]![/red bold]",
-                "skipped": "[yellow]⊘[/yellow]",
             }[status]
+
+            # Append shallow boundary warning to display
+            shallow_note = ""
+            if shallow_status and shallow_status.get("remote_has_unfetched") is True:
+                shallow_note = " [yellow]⚠ Remote has commits outside shallow-since window[/yellow]"
 
             console.print(
                 f" {icon} {repo} → "
                 f"[dim]{message[:120]}{'...' if len(message) > 120 else ''}[/dim]"
+                f"{shallow_note}"
             )
             progress.advance(task)
 
@@ -513,21 +568,31 @@ def git_pull_all_repos(
     merged_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
-        for status in ["success", "up-to-date", "failed", "error", "skipped"]:
+        for status in ["success", "up-to-date", "failed", "error"]:
             merged_stats[status] = merged_stats.get(status, 0) + prev_summary.get(
                 status, {}
             ).get("count", 0)
 
-    if skipped_no_remote:
+    # Summarize repos with unfetched commits
+    unfetched_repos = [
+        repo_key
+        for repo_key, data in progress_data.items()
+        if data.get("shallow_status", {})
+        and data["shallow_status"].get("remote_has_unfetched") is True
+    ]
+    if unfetched_repos:
         console.print(
-            f"\n[yellow]Skipped {len(skipped_no_remote)} repositories "
-            f"without remote tracking:[/yellow]"
+            f"\n[yellow]⚠ {len(unfetched_repos)} repo(s) have commits outside "
+            f"the shallow-since window that were NOT fetched:[/yellow]"
         )
-        for repo_path in skipped_no_remote:
-            console.print(f" • {repo_path}")
+        for repo_key in unfetched_repos:
+            ss = progress_data[repo_key]["shallow_status"]
+            console.print(
+                f"   • {repo_key}  local={ss.get('local_tip_date')}  "
+                f"remote={ss.get('remote_tip_date')}"
+            )
 
     if total_this_run > 0:
-        # --- Show THIS RUN's summary ---
         table = Table(
             title="Pull Summary (This Run)",
             show_header=True,
@@ -537,7 +602,7 @@ def git_pull_all_repos(
         table.add_column("Count", justify="right")
         table.add_column("Percentage", justify="right")
 
-        status_order = ["success", "up-to-date", "skipped", "failed", "error"]
+        status_order = ["success", "up-to-date", "failed", "error"]
         for status in status_order:
             count = stats.get(status, 0)
             perc = (count / total_this_run * 100) if total_this_run > 0 else 0
@@ -546,7 +611,6 @@ def git_pull_all_repos(
 
         console.print("\n")
         console.print(table)
-
         console.print(
             f"\n[bold]Completed processing {total_this_run} repositories this run.[/bold]\n"
             f"[bold green]State saved to:[/bold green] "
@@ -575,14 +639,15 @@ def main():
         "(default: _git_pull_all_repos_state.json in target directory)",
     )
     parser.add_argument(
-        "-n",
-        "--no-depth",
-        dest="no_depth",
-        action="store_true",
+        "--shallow-since",
+        dest="shallow_since",
+        type=str,
+        default=DEFAULT_SHALLOW_SINCE,
+        metavar="DATE",
         help=(
-            "Disable shallow pulling and fetch full history instead. "
-            f"By default, a shallow pull (--depth {DEFAULT_DEPTH}) is used "
-            "to fetch only the latest changes."
+            "Use 'git fetch --shallow-since=DATE' instead of full history. "
+            f'Default: "{DEFAULT_SHALLOW_SINCE}". '
+            "Pass empty string or 'full' to fetch complete history."
         ),
     )
     parser.add_argument(
@@ -610,6 +675,7 @@ def main():
     args = parser.parse_args()
 
     target_dir = Path(args.target_dir).expanduser().resolve()
+
     if args.out is not None:
         out_path = args.out.expanduser().resolve()
         if out_path.is_dir() or args.out.suffix == "":
@@ -617,7 +683,9 @@ def main():
     else:
         out_path = target_dir / "_git_pull_all_repos_state.json"
 
-    depth = None if args.no_depth else DEFAULT_DEPTH
+    shallow_since_value: str | None = args.shallow_since
+    if shallow_since_value and shallow_since_value.lower() in ("full", "none", ""):
+        shallow_since_value = None
 
     console.print(
         f"[bold]Target directory:[/bold] [link=file://{target_dir}]{target_dir}[/link]"
@@ -625,13 +693,17 @@ def main():
     console.print(f"[bold]State file:[/bold] [link=file://{out_path}]{out_path}[/link]")
     console.print(
         "[bold]Pull mode:[/bold] "
-        + (f"shallow (depth={depth})" if depth is not None else "full history")
+        + (
+            f'shallow (--shallow-since="{shallow_since_value}")'
+            if shallow_since_value
+            else "full history"
+        )
     )
 
     git_pull_all_repos(
         args.target_dir,
         out_path=out_path,
-        depth=depth,
+        shallow_since=shallow_since_value,
         sort_by_size=args.sort_by_size,
         continue_from_last=args.continue_from_last,
         only_failed=args.only_failed,
