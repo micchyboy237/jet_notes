@@ -47,7 +47,7 @@ from rich.table import Table
 
 console = Console()
 DEFAULT_SHALLOW_SINCE = "1 year ago"
-DEFAULT_FETCH_TIMEOUT = 30
+DEFAULT_FETCH_TIMEOUT = 60
 
 
 def _cleanup_stale_locks(repo_path: Path) -> bool:
@@ -167,7 +167,11 @@ def run_git_pull(
 
     try:
         subprocess.run(
-            fetch_cmd, capture_output=True, text=True, timeout=fetch_timeout, check=True
+            fetch_cmd,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=fetch_timeout,
+            check=True,
         )
     except subprocess.TimeoutExpired:
         return "failed", f"Fetch timed out after {fetch_timeout}s", None
