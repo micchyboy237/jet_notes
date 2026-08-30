@@ -4,6 +4,7 @@ Features:
   • Resumable: state is saved after every repo; use --continue after Ctrl+C.
   • Retry failed: use --only-failed to retry only previously failed repos.
   • Time-based shallow fetch (--shallow-since) or full history.
+  • Pre-flight stale lock cleanup prevents 'shallow.lock' errors.
   • Shallow boundary verification: detects if remote has commits outside
     the shallow-since window that were not fetched.
   • Merge conflicts are caught and recorded as "error" state.
@@ -45,9 +46,36 @@ from rich.progress import (
 from rich.table import Table
 
 console = Console()
-
 DEFAULT_SHALLOW_SINCE = "1 year ago"
-DEFAULT_FETCH_TIMEOUT = 30  # seconds
+DEFAULT_FETCH_TIMEOUT = 30
+
+
+def _cleanup_stale_locks(repo_path: Path) -> bool:
+    """Remove stale git lock files before operations begin.
+
+    Returns True if a lock was removed, False otherwise.
+    This prevents 'Unable to create shallow.lock' errors from
+    previously interrupted processes.
+    """
+    lock_files = [
+        repo_path / ".git" / "shallow.lock",
+        repo_path / ".git" / "index.lock",
+        repo_path / ".git" / "HEAD.lock",
+    ]
+    cleaned = False
+    for lock_path in lock_files:
+        if lock_path.exists():
+            try:
+                lock_path.unlink(missing_ok=True)
+                console.print(
+                    f"  [yellow]⚠ Removed stale lock:[/yellow] {lock_path.name}"
+                )
+                cleaned = True
+            except OSError as e:
+                console.print(
+                    f"  [red]✗ Failed to remove lock {lock_path.name}: {e}[/red]"
+                )
+    return cleaned
 
 
 def _check_shallow_boundary(
@@ -116,16 +144,23 @@ def run_git_pull(
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
     """Execute git pull with automatic fast-forward/force-push recovery.
-    Handles stale .git lock files by removing them once.
+
+    Includes pre-flight stale lock cleanup to prevent 'shallow.lock' errors.
+    Always enforces shallow_since when specified.
     Timeouts and network errors are recorded as 'failed' and move on immediately.
     Detached HEAD repos fall back to origin/HEAD or skip merge gracefully.
+
     Args:
         repo_path: Path to the git repository.
         shallow_since: Date string for --shallow-since or None for full history.
         fetch_timeout: Max seconds for git fetch (default: 30).
+
     Returns:
         (status, message, shallow_status_dict).
     """
+    # === PRE-FLIGHT CLEANUP ===
+    _cleanup_stale_locks(repo_path)
+
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if shallow_since:
         fetch_cmd.extend(["--shallow-since", shallow_since])
@@ -138,38 +173,39 @@ def run_git_pull(
         return "failed", f"Fetch timed out after {fetch_timeout}s", None
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.strip()
-        # Handle stale lock file once
-        if "Unable to create" in stderr and ".git/shallow.lock" in stderr:
+        # Safety net: handle lock errors that appear mid-operation
+        if "Unable to create" in stderr and ".lock" in stderr:
             lock_path = repo_path / ".git" / "shallow.lock"
             if lock_path.exists():
                 try:
-                    lock_path.unlink()
+                    lock_path.unlink(missing_ok=True)
                     console.print(
-                        f" [green]✓[/green] [dim]Removed stale lock file[/dim]"
+                        f"  [green]✓[/green] [dim]Removed stale lock during retry[/dim]"
                     )
-                    try:
-                        subprocess.run(
-                            fetch_cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=fetch_timeout,
-                            check=True,
-                        )
-                    except Exception as retry_err:
-                        return (
-                            "failed",
-                            f"Fetch failed after lock cleanup: {retry_err}",
-                            None,
-                        )
-                except OSError as unlink_error:
-                    return "failed", f"Failed to remove lock: {unlink_error}", None
+                    subprocess.run(
+                        fetch_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=fetch_timeout,
+                        check=True,
+                    )
+                except Exception as retry_err:
+                    return (
+                        "failed",
+                        f"Fetch failed after emergency lock cleanup: {retry_err}",
+                        None,
+                    )
             else:
-                return "failed", f"Fetch failed: {stderr}", None
-        return "failed", f"Fetch failed: {stderr}", None
+                return (
+                    "failed",
+                    f"Fetch failed (lock error but no file): {stderr}",
+                    None,
+                )
+        else:
+            return "failed", f"Fetch failed: {stderr}", None
     except Exception as e:
         return "failed", f"Fetch exception: {e}", None
 
-    # Determine branch with detached HEAD fallback
     branch = None
     try:
         result = subprocess.run(
@@ -210,7 +246,6 @@ def run_git_pull(
                 shallow_status,
             )
 
-    # Fast-forward merge
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "merge", "--ff-only", f"origin/{branch}"],
@@ -252,7 +287,6 @@ def run_git_pull(
                 None,
             )
 
-    # Hard reset fallback for force-pushed branches
     try:
         subprocess.run(
             ["git", "-C", str(repo_path), "reset", "--hard", f"origin/{branch}"],
@@ -311,7 +345,6 @@ def _build_state(
             ).get("count", 0)
 
     total_for_summary = sum(final_stats.values()) or total
-
     summary: dict[str, dict[str, float]] = {}
     for status, count in final_stats.items():
         percentage = (
@@ -407,7 +440,6 @@ def git_pull_all_repos(
         if shallow_since
         else "[bold yellow]Full history mode (no shallow-since)[/bold yellow]"
     )
-
     if continue_from_last:
         console.print(
             "[bold cyan]Mode: Continue from last unprocessed repo[/bold cyan]"
@@ -548,11 +580,13 @@ def git_pull_all_repos(
             repo = repo_info.path
             short_name = repo_info.name
             repo_key = str(repo)
+
             progress.update(task, description=f"[cyan]Pulling {short_name}...")
 
             status, message, shallow_status = run_git_pull(
                 repo, shallow_since=shallow_since
             )
+
             stats[status] += 1
             progress_data[repo_key] = {
                 "status": status,
@@ -574,7 +608,6 @@ def git_pull_all_repos(
                 "error": "[red bold]![/red bold]",
             }[status]
 
-            # Append shallow boundary warning to display
             shallow_note = ""
             if shallow_status and shallow_status.get("remote_has_unfetched") is True:
                 shallow_note = " [yellow]⚠ Remote has commits outside shallow-since window[/yellow]"
@@ -596,13 +629,13 @@ def git_pull_all_repos(
                 status, {}
             ).get("count", 0)
 
-    # Summarize repos with unfetched commits
     unfetched_repos = [
         repo_key
         for repo_key, data in progress_data.items()
         if data.get("shallow_status", {})
         and data["shallow_status"].get("remote_has_unfetched") is True
     ]
+
     if unfetched_repos:
         console.print(
             f"\n[yellow]⚠ {len(unfetched_repos)} repo(s) have commits outside "
@@ -694,7 +727,6 @@ def main():
         action="store_true",
         help="Only retry repositories that failed in the previous run",
     )
-
     args = parser.parse_args()
 
     target_dir = Path(args.target_dir).expanduser().resolve()
