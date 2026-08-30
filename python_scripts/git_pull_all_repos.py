@@ -50,6 +50,15 @@ DEFAULT_SHALLOW_SINCE = "1 year ago"
 DEFAULT_FETCH_TIMEOUT = 60
 
 
+def _safe_strip(text: str | bytes | None) -> str:
+    """Safely strip subprocess output that may be None."""
+    if text is None:
+        return ""
+    if isinstance(text, bytes):
+        return text.decode("utf-8", errors="replace").strip()
+    return str(text).strip()
+
+
 def _cleanup_stale_locks(repo_path: Path) -> bool:
     """Remove stale git lock files before operations begin.
 
@@ -144,31 +153,21 @@ def run_git_pull(
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
     """Execute git pull with automatic fast-forward/force-push recovery.
-
     Includes pre-flight stale lock cleanup to prevent 'shallow.lock' errors.
     Always enforces shallow_since when specified.
     Timeouts and network errors are recorded as 'failed' and move on immediately.
     Detached HEAD repos fall back to origin/HEAD or skip merge gracefully.
-
-    Args:
-        repo_path: Path to the git repository.
-        shallow_since: Date string for --shallow-since or None for full history.
-        fetch_timeout: Max seconds for git fetch (default: 30).
-
-    Returns:
-        (status, message, shallow_status_dict).
     """
-    # === PRE-FLIGHT CLEANUP ===
     _cleanup_stale_locks(repo_path)
-
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if shallow_since:
         fetch_cmd.extend(["--shallow-since", shallow_since])
 
     try:
+        # FIX: Use capture_output=True to ensure stderr is never None
         subprocess.run(
             fetch_cmd,
-            stdout=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=fetch_timeout,
             check=True,
@@ -176,8 +175,7 @@ def run_git_pull(
     except subprocess.TimeoutExpired:
         return "failed", f"Fetch timed out after {fetch_timeout}s", None
     except subprocess.CalledProcessError as e:
-        stderr = e.stderr.strip()
-        # Safety net: handle lock errors that appear mid-operation
+        stderr = _safe_strip(e.stderr)
         if "Unable to create" in stderr and ".lock" in stderr:
             lock_path = repo_path / ".git" / "shallow.lock"
             if lock_path.exists():
@@ -264,7 +262,7 @@ def run_git_pull(
         shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
         return "success", result.stdout.strip(), shallow_status
     except subprocess.CalledProcessError as merge_err:
-        merge_stderr = merge_err.stderr.strip()
+        merge_stderr = _safe_strip(merge_err.stderr)
         conflict_indicators = (
             "CONFLICT",
             "Automatic merge failed",
@@ -302,7 +300,7 @@ def run_git_pull(
         shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
         return "success", "Hard reset to origin (force-push recovery)", shallow_status
     except subprocess.CalledProcessError as e:
-        return "failed", f"Reset failed: {e.stderr.strip()}", None
+        return "failed", f"Reset failed: {_safe_strip(e.stderr)}", None
     except Exception as e:
         return "error", f"Exception during reset: {e}", None
 
@@ -339,7 +337,11 @@ def _build_state(
     completed: bool = False,
     previous_state: dict | None = None,
 ) -> dict:
-    """Build the complete state dictionary with proper merging for continue/only-failed."""
+    """Build the complete state dictionary with proper merging for continue/only-failed.
+
+    FIX: Deduplicates grouped_results and properly cleans failed entries
+    when repos succeed or become up-to-date in subsequent runs.
+    """
     final_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
@@ -361,30 +363,51 @@ def _build_state(
             "percentage": percentage,
         }
 
+    # Collect all repo paths processed in THIS run
+    current_run_paths: set[str] = set()
+    for paths_list in grouped_results.values():
+        current_run_paths.update(paths_list)
+
     final_grouped: dict[str, list[str]] = {
         "success": [],
         "up-to-date": [],
         "failed": [],
         "error": [],
     }
+
     if previous_state:
+        prev_grouped = previous_state.get("grouped_results", {})
         for k in final_grouped:
-            final_grouped[k] = previous_state.get("grouped_results", {}).get(k, [])[:]
+            # FIX: Exclude any repo that was processed in the current run
+            # This prevents duplicates and handles status migration
+            final_grouped[k] = [
+                path
+                for path in prev_grouped.get(k, [])
+                if path not in current_run_paths
+            ]
+
+    # Add current run results (already deduplicated by exclusion above)
     for k in grouped_results:
         final_grouped[k].extend(grouped_results[k])
 
+    # FIX: Properly clean failed entries
+    # Remove any previous failed entry whose repo was processed in this run
+    # (regardless of whether it succeeded, failed again, or errored)
     final_failed = []
     if previous_state:
-        current_failed_paths = {entry["repoPath"] for entry in failed_entries}
         final_failed = [
             entry
             for entry in previous_state.get("failed", [])
-            if entry["repoPath"] not in current_failed_paths
+            if entry["repoPath"] not in current_run_paths
         ]
-        console.print(
-            f"[dim]State merge: keeping {len(final_failed)} previous failed entries, "
-            f"replacing {len(current_failed_paths)} with current results[/dim]"
-        )
+        kept_count = len(final_failed)
+        removed_count = len(previous_state.get("failed", [])) - kept_count
+        if removed_count > 0:
+            console.print(
+                f"[dim]State merge: cleaned {removed_count} resolved/reprocessed "
+                f"entries from failed list, keeping {kept_count} unresolved[/dim]"
+            )
+
     final_failed.extend(failed_entries)
 
     return {
