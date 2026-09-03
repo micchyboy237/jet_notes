@@ -27,34 +27,31 @@ from rich.table import Table
 # --- Configuration ---
 INTERFACE = "en1"
 CHECK_IP = "8.8.8.8"
-CHECK_INTERVAL = 5  # Health check every 5 seconds
-SPEED_CHECK_INTERVAL = 15  # Speed test every 15 seconds
-COOLDOWN_PERIOD = 15  # Wait after applying a fix before re-checking
-MAX_RETRIES = 3  # Fix attempts before pausing auto-fix
-DEBUG_LOG_MIN_INTERVAL = 300  # Full debug dump at most every 5 minutes
+CHECK_INTERVAL = 5
+SPEED_CHECK_INTERVAL = 15
+COOLDOWN_PERIOD = 15
+MAX_RETRIES = 3
+DEBUG_LOG_MIN_INTERVAL = 300
 INTERFACE_RECOVERY_TIMEOUT = 15
 
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
 
-# Speed test configuration
-SPEED_TEST_BYTES_NORMAL = 2_000_000  # 2.0MB for healthy connections
-SPEED_TEST_BYTES_DEGRADED = 500_000  # 0.5MB for degraded connections (adaptive)
-SPEED_DEGRADED_THRESHOLD = 0.3  # Mbps threshold to trigger degraded mode + fix
+SPEED_TEST_BYTES_NORMAL = 2_000_000
+SPEED_TEST_BYTES_DEGRADED = 500_000
+SPEED_DEGRADED_THRESHOLD = 0.3
 SPEED_TEST_PROGRESS_INTERVAL = 0.5
 SPEED_TEST_URL_TEMPLATE = "https://speed.cloudflare.com/__down?bytes={}"
-SPEED_ROLLING_WINDOW = 3  # Number of recent speed samples to average
-SPEED_TEST_MIN_VALID_ELAPSED = 0.5  # Min elapsed time to consider valid (seconds)
+SPEED_ROLLING_WINDOW = 3
+SPEED_TEST_MIN_VALID_ELAPSED = 0.5
 SPEED_TEST_MAX_DURATION_SEC = 15
 
-# ✅ IMPROVEMENT: Lowered from 3 to 2 for faster reaction to blackholes
-CONSECUTIVE_ZERO_THRESHOLD = 2
+CONSECUTIVE_ZERO_THRESHOLD = 3
 
-# DNS validation configuration
 PRIMARY_DNS = "1.1.1.1"
 FALLBACK_DNS = "8.8.8.8"
 DNS_QUERY_TIMEOUT = 3
-# ✅ IMPROVEMENT: Test the EXACT domain curl uses, not just cloudflare.com
+# ✅ FIX: Match exact domain used by speed test to avoid domain-specific DNS issues
 DNS_TEST_DOMAIN = "speed.cloudflare.com"
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -86,12 +83,10 @@ _last_health_status = None
 _last_debug_log_time = 0
 _speed_history = deque(maxlen=SPEED_ROLLING_WINDOW)
 _consecutive_zero_tests = 0
-
 _manual_speed_test_requested = False
 
 
 def require_root():
-    """Exit with error if not running as root."""
     if os.geteuid() != 0:
         console.print(
             "\n[bold red]✗ Network Guardian must be run as root.[/bold red]\n"
@@ -103,7 +98,6 @@ def require_root():
 
 
 def run_cmd(cmd, timeout=2):
-    """Run a shell command safely. Returns stdout only; does NOT auto-log output."""
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=timeout
@@ -119,25 +113,14 @@ def run_cmd(cmd, timeout=2):
         return ""
 
 
-def is_valid_ip(text):
-    """
-    ✅ NEW: Validate that text is an actual IP address, not a dig error message.
-    Prevents ';; connection timed out' from being treated as a valid IP.
-    """
-    if not text:
+def _is_valid_ipv4(s):
+    """✅ FIX: Validate string is actually an IPv4 address, not a dig error message."""
+    if not s or s.startswith(";"):
         return False
-    # dig errors start with ';' or contain letters other than hex
-    if text.startswith(";"):
-        return False
-    # Basic IPv4 validation
-    ipv4_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
-    # Basic IPv6 validation (simplified)
-    ipv6_pattern = r"^[0-9a-fA-F:]+$"
-    return bool(re.match(ipv4_pattern, text)) or bool(re.match(ipv6_pattern, text))
+    return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", s))
 
 
 def get_average_speed():
-    """Returns rolling average of last N valid speed samples, or None if no data."""
     if not _speed_history:
         return None
     avg = round(sum(_speed_history) / len(_speed_history), 3)
@@ -149,10 +132,6 @@ def get_average_speed():
 
 
 def check_health_scutil():
-    """
-    Instant health check using scutil with smart debug logging.
-    Includes live DNS query validation targeting the exact speed test domain.
-    """
     global _last_health_status, _last_debug_log_time
 
     nwi = run_cmd("scutil --nwi", timeout=3)
@@ -185,19 +164,15 @@ def check_health_scutil():
         _last_health_status = "DNS Missing"
         return False, "DNS Missing"
 
-    # ✅ IMPROVEMENT: Force IPv4 (-4) and test exact speed test domain
-    # This prevents AAAA timeout masking and catches domain-specific failures
+    # ✅ FIX: Test exact speed test domain with IPv4-only to prevent AAAA timeout masking
     dns_test = run_cmd(
-        f"dig +short -4 +time={DNS_QUERY_TIMEOUT} +tries=1 "
-        f"{DNS_TEST_DOMAIN} @{PRIMARY_DNS}",
+        f"dig +short +time={DNS_QUERY_TIMEOUT} +tries=1 -4 {DNS_TEST_DOMAIN} @{PRIMARY_DNS}",
         timeout=5,
     )
-
-    # ✅ IMPROVEMENT: Validate output is an actual IP, not an error string
-    if not dns_test or not is_valid_ip(dns_test):
+    if not _is_valid_ipv4(dns_test):
         log.warning(
-            f"Primary DNS {PRIMARY_DNS} configured but cannot resolve "
-            f"{DNS_TEST_DOMAIN} (output: '{dns_test[:60] if dns_test else 'empty'}')"
+            f"Primary DNS {PRIMARY_DNS} not resolving {DNS_TEST_DOMAIN} "
+            f"(output: '{dns_test[:80]}')"
         )
         _last_health_status = "DNS Unresponsive"
         return False, "DNS Unresponsive"
@@ -212,9 +187,7 @@ def check_health_scutil():
         log.debug(f"NWI Output:\n{nwi}")
         log.debug(f"Reachability ({CHECK_IP}): {reach}")
         log.debug(f"DNS Output:\n{dns}")
-        log.debug(
-            f"Live DNS query test ({DNS_TEST_DOMAIN}@{PRIMARY_DNS}): OK ({dns_test})"
-        )
+        log.debug(f"Live DNS query ({DNS_TEST_DOMAIN}@{PRIMARY_DNS}): {dns_test}")
         log.debug("All scutil health checks passed")
         _last_debug_log_time = now
 
@@ -223,7 +196,6 @@ def check_health_scutil():
 
 
 def _watch_speed_progress(tmp_path, stop_event, progress, task_id, total_bytes):
-    """Background thread: polls temp file size and updates Rich Progress bar."""
     last_bytes = 0
     last_time = time.time()
 
@@ -254,11 +226,6 @@ def _watch_speed_progress(tmp_path, stop_event, progress, task_id, total_bytes):
 
 
 def check_speed_live():
-    """
-    Adaptive download speed test via curl with dual progress display.
-    Tracks consecutive zero-byte failures separately from rolling average.
-    Includes validated IP-direct retry when DNS resolution fails.
-    """
     global _consecutive_zero_tests
 
     avg_speed = get_average_speed()
@@ -297,10 +264,7 @@ def check_speed_live():
             console=console,
             transient=True,
         ) as progress:
-            task_id = progress.add_task(
-                "[cyan]Connecting...[/cyan]",
-                total=test_bytes,
-            )
+            task_id = progress.add_task("[cyan]Connecting...[/cyan]", total=test_bytes)
 
             watcher = threading.Thread(
                 target=_watch_speed_progress,
@@ -324,6 +288,7 @@ def check_speed_live():
                     "-H",
                     "Pragma: no-cache",
                     "--no-sessionid",
+                    "-4",  # ✅ FIX: Force IPv4 to prevent AAAA timeout masking
                     url,
                 ],
                 capture_output=True,
@@ -344,71 +309,61 @@ def check_speed_live():
         if final_bytes == 0:
             log.warning(
                 "Speed test completed but temp file is empty (0 bytes). "
-                "Likely cached response or connection failure. Discarding sample."
+                "Discarding sample."
             )
             _consecutive_zero_tests += 1
             test_valid = False
 
-            # ✅ IMPROVEMENT: Validated IP-direct retry diagnostic
+            # ✅ FIX: IP-direct retry with proper dig output validation
             if (
                 "Resolving timed out" in curl_stderr
                 or "Could not resolve host" in curl_stderr
             ):
                 log.warning(
-                    "DNS resolution failed; retrying with IP-direct to isolate issue..."
+                    "DNS resolution failed; retrying with IP-direct to isolate..."
                 )
                 ip_resolve = run_cmd(
-                    f"dig +short -4 +time={DNS_QUERY_TIMEOUT} +tries=1 "
-                    f"speed.cloudflare.com @{FALLBACK_DNS}",
+                    f"dig +short +time={DNS_QUERY_TIMEOUT} +tries=1 -4 "
+                    f"{DNS_TEST_DOMAIN} @{FALLBACK_DNS}",
                     timeout=5,
                 )
-
-                # ✅ FIX: Only proceed if we got a VALID IP address
-                if is_valid_ip(ip_resolve):
-                    log.info(
-                        f"Resolved via fallback DNS: {ip_resolve}; testing IP-direct"
-                    )
+                if _is_valid_ipv4(ip_resolve):
+                    ip_direct_url = f"https://{ip_resolve}/__down?bytes={test_bytes}&nocache={nocache}"
+                    log.info(f"Resolved via fallback: {ip_resolve}; testing IP-direct")
                     ip_result = subprocess.run(
                         [
                             "curl",
-                            "-s",
+                            "-#",
                             "-o",
                             "/dev/null",
-                            "-w",
-                            "%{http_code}",
                             "--max-time",
                             str(SPEED_TEST_MAX_DURATION_SEC),
                             "-H",
-                            "Host: speed.cloudflare.com",
+                            f"Host: {DNS_TEST_DOMAIN}",
                             "--resolve",
-                            f"speed.cloudflare.com:443:{ip_resolve}",
-                            f"https://speed.cloudflare.com/__down?bytes=1000&nocache={nocache}",
+                            f"{DNS_TEST_DOMAIN}:443:{ip_resolve}",
+                            "-4",
+                            ip_direct_url,
                         ],
                         capture_output=True,
                         text=True,
                         timeout=20,
                     )
-                    if ip_result.returncode == 0 and ip_result.stdout.strip() == "200":
-                        log.info(
-                            "✅ IP-direct succeeded: Issue confirmed as DNS-only. "
-                            "Primary resolver is non-functional."
-                        )
+                    if ip_result.returncode == 0:
+                        log.info("✅ IP-direct succeeded: DNS-only issue confirmed")
                     else:
                         log.warning(
-                            f"❌ IP-direct also failed (HTTP: {ip_result.stdout.strip()}, "
-                            f"rc: {ip_result.returncode}): True connectivity blackhole."
+                            "❌ IP-direct also failed: True connectivity blackhole"
                         )
                 else:
                     log.warning(
-                        f"Fallback DNS ({FALLBACK_DNS}) also failed to resolve "
-                        f"(output: '{ip_resolve[:60] if ip_resolve else 'empty'}'); "
-                        "likely full connectivity loss."
+                        f"Fallback DNS ({FALLBACK_DNS}) also failed "
+                        f"(output: '{ip_resolve[:80]}'); full connectivity loss likely"
                     )
 
         elif elapsed_total < SPEED_TEST_MIN_VALID_ELAPSED:
             log.warning(
-                f"Suspiciously fast completion ({elapsed_total:.3f}s for "
-                f"{final_bytes} bytes). Likely cached response. Discarding sample."
+                f"Suspiciously fast completion ({elapsed_total:.3f}s). Discarding."
             )
             _consecutive_zero_tests += 1
             test_valid = False
@@ -480,18 +435,15 @@ def check_speed_live():
 
 def apply_fix(issue_type):
     """
-    Targeted fix matching proven manual workflow:
-    1. Flush DNS cache + restart mDNSResponder
-    2. Renew DHCP (only if dynamic, skip if static)
-    3. Power cycle WiFi on CORRECT interface
-    4. Poll for recovery instead of blind sleep
+    Targeted fix matching user's proven manual workflow.
+    Uses correct INTERFACE variable throughout.
     """
     global _consecutive_zero_tests
 
     log.warning(f"Applying targeted fix for: {issue_type}")
 
-    # ✅ Step 1: Universal DNS flush (matches your manual killall -HUP mDNSResponder)
-    log.info("Step 1/3: Flushing DNS cache and restarting mDNSResponder...")
+    # ✅ Universal pre-fix: DNS flush (matches user's first manual step)
+    log.info("Pre-fix: Flushing DNS cache and restarting mDNSResponder...")
     run_cmd("dscacheutil -flushcache", timeout=5)
     run_cmd("killall -HUP mDNSResponder", timeout=5)
 
@@ -501,80 +453,104 @@ def apply_fix(issue_type):
         return False
 
     elif issue_type == "DNS Unresponsive":
+        # ✅ Immediate fix: Don't wait for 3 consecutive zeros
+        # Matches user's manual workflow: flush → DHCP → power cycle
         log.info(f"Testing fallback DNS ({FALLBACK_DNS})...")
         fallback_test = run_cmd(
-            f"dig +short -4 +time={DNS_QUERY_TIMEOUT} +tries=1 "
-            f"google.com @{FALLBACK_DNS}",
+            f"dig +short +time={DNS_QUERY_TIMEOUT} +tries=1 -4 google.com @{FALLBACK_DNS}",
             timeout=5,
         )
-        if fallback_test and is_valid_ip(fallback_test):
-            log.info(
-                f"Fallback DNS ({FALLBACK_DNS}) responding; "
-                "re-flushing local cache to pick up changes"
-            )
-            run_cmd("dscacheutil -flushcache", timeout=5)
-            run_cmd("killall -HUP mDNSResponder", timeout=5)
+        if _is_valid_ipv4(fallback_test):
+            log.info(f"Fallback DNS ({FALLBACK_DNS}) responding; cache flushed")
             return True
         else:
+            # ✅ Both DNS servers failed → apply full manual fix sequence
             log.warning(
-                "Both primary and fallback DNS unresponsive; "
-                "falling through to full interface reset"
+                f"Both DNS servers unresponsive; applying full recovery sequence "
+                f"on {INTERFACE}..."
             )
-            # Fall through to interface power cycle below
+            _apply_full_recovery_sequence()
+            return True
 
-    # ✅ Unified interface reset for all connectivity issues
-    # This handles: Interface Missing, Speed Degraded, Connected No Data,
-    # Not Reachable, DNS Unresponsive (fallback failed), DNS Missing
-    if issue_type in (
-        "Interface Missing",
-        "Speed Degraded",
-        "Connected No Data",
-        "Not Reachable",
-        "DNS Unresponsive",
-        "DNS Missing",
-    ):
-        # ✅ Step 2: Safe DHCP renewal (skips if static IP)
-        # Unlike your manual command that blindly ran on en0, this checks first
-        dhcp_status = run_cmd(f"ipconfig getpacket {INTERFACE}", timeout=5)
-        if dhcp_status:
-            log.info(f"Step 2/3: Renewing DHCP lease on {INTERFACE}...")
-            run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
-            time.sleep(2)
-        else:
-            log.info(
-                f"Step 2/3: Static IP detected on {INTERFACE}; "
-                "skipping DHCP renewal (would break connection)"
-            )
-
-        # ✅ Step 3: Power cycle on CORRECT interface with polling
-        # Unlike your manual 'sleep 10', this recovers as soon as ready
-        log.info(f"Step 3/3: Power cycling {INTERFACE}...")
+    elif issue_type in ("Interface Missing", "Speed Degraded"):
+        log.info(f"Cycling power on {INTERFACE}...")
         run_cmd(f"networksetup -setairportpower {INTERFACE} off", timeout=10)
-        time.sleep(3)  # Brief pause for hardware to fully power down
+        time.sleep(3)
         run_cmd(f"networksetup -setairportpower {INTERFACE} on", timeout=10)
 
-        # ✅ Poll for recovery instead of blind sleep 10
         for i in range(INTERFACE_RECOVERY_TIMEOUT):
             time.sleep(1)
             nwi = run_cmd("scutil --nwi", timeout=3)
             if f"{INTERFACE} :" in nwi:
                 log.info(f"Interface {INTERFACE} recovered after {i + 1}s")
-                _consecutive_zero_tests = 0
                 return True
-
-        log.error(
-            f"Power cycle failed to restore {INTERFACE} "
-            f"after {INTERFACE_RECOVERY_TIMEOUT}s"
-        )
+        log.error(f"Power cycle failed after {INTERFACE_RECOVERY_TIMEOUT}s")
         return False
+
+    elif issue_type == "Connected No Data":
+        # ✅ Full recovery sequence matching user's manual workflow
+        log.info("Applying full recovery sequence for connectivity blackhole...")
+        _apply_full_recovery_sequence()
+        return True
+
+    elif issue_type == "Not Reachable":
+        dhcp_status = run_cmd(f"ipconfig getpacket {INTERFACE}", timeout=5)
+        if dhcp_status:
+            log.info(f"Renewing DHCP lease on {INTERFACE}...")
+            run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
+        else:
+            log.info(f"Static IP on {INTERFACE}; skipping DHCP renewal")
+        return True
+
+    elif issue_type == "DNS Missing":
+        log.info("DNS pre-flush completed; resolver should recover on next check")
+        return True
 
     else:
         log.error(f"No fix defined for issue type: {issue_type}")
         return False
 
 
+def _apply_full_recovery_sequence():
+    """
+    ✅ Encapsulates user's proven manual fix workflow using correct INTERFACE.
+    Equivalent to:
+      sudo killall -HUP mDNSResponder
+      sudo ipconfig set en1 DHCP
+      sudo networksetup -setairportpower en1 off
+      sleep 10
+      sudo networksetup -setairportpower en1 on
+    """
+    global _consecutive_zero_tests
+
+    # Step 1: DHCP renewal (safe check for static IP)
+    dhcp_status = run_cmd(f"ipconfig getpacket {INTERFACE}", timeout=5)
+    if dhcp_status:
+        log.info(f"Renewing DHCP lease on {INTERFACE}...")
+        run_cmd(f"ipconfig set {INTERFACE} DHCP", timeout=10)
+        time.sleep(2)
+    else:
+        log.info(f"Static IP on {INTERFACE}; skipping DHCP renewal")
+
+    # Step 2: Power cycle with 10s wait (matches user's manual sleep 10)
+    log.info(f"Power cycling {INTERFACE} (off → 10s wait → on)...")
+    run_cmd(f"networksetup -setairportpower {INTERFACE} off", timeout=10)
+    time.sleep(10)
+    run_cmd(f"networksetup -setairportpower {INTERFACE} on", timeout=10)
+
+    # Step 3: Poll for recovery
+    for i in range(INTERFACE_RECOVERY_TIMEOUT):
+        time.sleep(1)
+        nwi = run_cmd("scutil --nwi", timeout=3)
+        if f"{INTERFACE} :" in nwi:
+            log.info(f"Interface {INTERFACE} recovered after {i + 1}s post-power-on")
+            _consecutive_zero_tests = 0
+            return
+
+    log.error(f"Interface {INTERFACE} failed to recover after full recovery sequence")
+
+
 def _input_listener(stop_event):
-    """Non-blocking keyboard listener thread for manual speed test trigger."""
     global _manual_speed_test_requested
 
     try:
@@ -671,11 +647,10 @@ def main():
                         end="\r",
                     )
 
-            # Health check (L3/L4 layer + live DNS validation)
             is_healthy, status = check_health_scutil()
 
-            # ✅ Check for connectivity blackhole BEFORE speed degradation
-            # Threshold lowered to 2 for faster reaction
+            # ✅ DNS Unresponsive triggers IMMEDIATELY (no consecutive threshold needed)
+            # Connected No Data still requires consecutive threshold
             if is_healthy and _consecutive_zero_tests >= CONSECUTIVE_ZERO_THRESHOLD:
                 is_healthy = False
                 status = "Connected No Data"
@@ -683,7 +658,6 @@ def main():
                     f"L3/L4 healthy but {_consecutive_zero_tests} consecutive speed tests "
                     f"returned 0 bytes. Connectivity blackhole detected."
                 )
-
             elif is_healthy:
                 avg_speed = get_average_speed()
                 if avg_speed is not None and avg_speed < SPEED_DEGRADED_THRESHOLD:
@@ -691,8 +665,7 @@ def main():
                     status = "Speed Degraded"
                     log.warning(
                         f"L3/L4 healthy but rolling avg speed degraded: "
-                        f"{avg_speed} Mbps (window={len(_speed_history)}) "
-                        f"< {SPEED_DEGRADED_THRESHOLD} Mbps"
+                        f"{avg_speed} Mbps < {SPEED_DEGRADED_THRESHOLD} Mbps"
                     )
 
             if is_healthy:
@@ -712,13 +685,12 @@ def main():
                 if auto_fix_paused:
                     log.error(
                         f"Auto-fix paused. Still seeing '{status}'. "
-                        "Manual intervention required. Will resume once network recovers."
+                        "Manual intervention required."
                     )
                 elif consecutive_failures <= MAX_RETRIES:
                     log.info(
                         f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
                     )
-
                     fix_succeeded = apply_fix(status)
                     last_fix_time = time.time()
 
@@ -730,7 +702,7 @@ def main():
                 else:
                     log.error(
                         f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
-                        "Pausing auto-fix until network recovers. Manual intervention required."
+                        "Pausing auto-fix until network recovers."
                     )
                     auto_fix_paused = True
 
