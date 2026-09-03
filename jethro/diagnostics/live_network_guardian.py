@@ -132,10 +132,14 @@ def get_average_speed():
 
 
 def check_health_scutil():
+    """
+    Instant health check using scutil with smart debug logging.
+
+    Includes live DNS query validation targeting the exact speed test domain.
+    """
     global _last_health_status, _last_debug_log_time
 
     nwi = run_cmd("scutil --nwi", timeout=3)
-
     if nwi == "":
         log.warning("scutil --nwi timed out or returned empty; possible daemon hang")
         _last_health_status = "Scutil Timeout"
@@ -164,11 +168,20 @@ def check_health_scutil():
         _last_health_status = "DNS Missing"
         return False, "DNS Missing"
 
-    # ✅ FIX: Test exact speed test domain with IPv4-only to prevent AAAA timeout masking
     dns_test = run_cmd(
         f"dig +short +time={DNS_QUERY_TIMEOUT} +tries=1 -4 {DNS_TEST_DOMAIN} @{PRIMARY_DNS}",
         timeout=5,
     )
+
+    # ✅ ENHANCEMENT: Provide clear diagnostic message for empty vs invalid responses
+    if not dns_test:
+        log.warning(
+            f"Primary DNS {PRIMARY_DNS} returned EMPTY response for "
+            f"{DNS_TEST_DOMAIN} (timeout or no record)"
+        )
+        _last_health_status = "DNS Unresponsive"
+        return False, "DNS Unresponsive"
+
     if not _is_valid_ipv4(dns_test):
         log.warning(
             f"Primary DNS {PRIMARY_DNS} not resolving {DNS_TEST_DOMAIN} "
@@ -179,7 +192,6 @@ def check_health_scutil():
 
     current_status = "Healthy"
     now = time.time()
-
     if current_status != _last_health_status or (
         now - _last_debug_log_time > DEBUG_LOG_MIN_INTERVAL
     ):
@@ -190,8 +202,8 @@ def check_health_scutil():
         log.debug(f"Live DNS query ({DNS_TEST_DOMAIN}@{PRIMARY_DNS}): {dns_test}")
         log.debug("All scutil health checks passed")
         _last_debug_log_time = now
+        _last_health_status = current_status
 
-    _last_health_status = current_status
     return True, current_status
 
 
