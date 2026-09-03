@@ -114,10 +114,12 @@ def run_cmd(cmd, timeout=2):
 
 
 def _is_valid_ipv4(s):
-    """✅ FIX: Validate string is actually an IPv4 address, not a dig error message."""
+    """Validate string contains at least one valid IPv4 address (handles multi-line dig output)."""
     if not s or s.startswith(";"):
         return False
-    return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", s))
+    # ✅ FIX: Check first non-empty line instead of entire string
+    first_line = s.strip().split("\n")[0].strip()
+    return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", first_line))
 
 
 def get_average_speed():
@@ -465,18 +467,21 @@ def apply_fix(issue_type):
         return False
 
     elif issue_type == "DNS Unresponsive":
-        # ✅ Immediate fix: Don't wait for 3 consecutive zeros
-        # Matches user's manual workflow: flush → DHCP → power cycle
         log.info(f"Testing fallback DNS ({FALLBACK_DNS})...")
         fallback_test = run_cmd(
             f"dig +short +time={DNS_QUERY_TIMEOUT} +tries=1 -4 google.com @{FALLBACK_DNS}",
             timeout=5,
         )
         if _is_valid_ipv4(fallback_test):
-            log.info(f"Fallback DNS ({FALLBACK_DNS}) responding; cache flushed")
+            # ✅ FIX: Fallback works but primary is broken → cache flush isn't enough
+            # Must escalate to full recovery to restore primary DNS path
+            log.warning(
+                f"Fallback DNS ({FALLBACK_DNS}) responding but primary "
+                f"{PRIMARY_DNS} is broken; escalating to full recovery..."
+            )
+            _apply_full_recovery_sequence()
             return True
         else:
-            # ✅ Both DNS servers failed → apply full manual fix sequence
             log.warning(
                 f"Both DNS servers unresponsive; applying full recovery sequence "
                 f"on {INTERFACE}..."
