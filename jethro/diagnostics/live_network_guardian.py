@@ -46,6 +46,7 @@ SPEED_TEST_MIN_VALID_ELAPSED = 0.5
 SPEED_TEST_MAX_DURATION_SEC = 15
 
 CONSECUTIVE_ZERO_THRESHOLD = 3
+CONSECUTIVE_DNS_FAIL_THRESHOLD = 2
 
 PRIMARY_DNS = "1.1.1.1"
 FALLBACK_DNS = "8.8.8.8"
@@ -81,6 +82,7 @@ _last_health_status = None
 _last_debug_log_time = 0
 _speed_history = deque(maxlen=SPEED_ROLLING_WINDOW)
 _consecutive_zero_tests = 0
+_consecutive_dns_failures = 0
 _manual_speed_test_requested = False
 
 
@@ -134,8 +136,9 @@ def check_health_scutil():
     """
     Instant health check using scutil with smart debug logging.
     Includes live DNS query validation targeting the exact speed test domain.
+    Requires consecutive DNS failures before reporting unhealthy.
     """
-    global _last_health_status, _last_debug_log_time
+    global _last_health_status, _last_debug_log_time, _consecutive_dns_failures
 
     nwi = run_cmd("scutil --nwi", timeout=3)
     if nwi == "":
@@ -171,23 +174,32 @@ def check_health_scutil():
         timeout=5,
     )
 
-    if not dns_test:
-        log.warning(
-            f"Primary DNS {PRIMARY_DNS} returned EMPTY response for "
-            f"{DNS_TEST_DOMAIN} (timeout or no record)"
+    # ✅ Require consecutive DNS failures to avoid transient timeout false positives
+    if not dns_test or not _is_valid_ipv4(dns_test):
+        _consecutive_dns_failures += 1
+        reason = (
+            "EMPTY response (timeout)"
+            if not dns_test
+            else f"invalid output: '{dns_test[:80]}'"
         )
-        _last_health_status = "DNS Unresponsive"
-        return False, "DNS Unresponsive"
 
-    if not _is_valid_ipv4(dns_test):
-        log.warning(
-            f"Primary DNS {PRIMARY_DNS} not resolving {DNS_TEST_DOMAIN} "
-            f"(output: '{dns_test[:80]}')"
-        )
-        _last_health_status = "DNS Unresponsive"
-        return False, "DNS Unresponsive"
+        if _consecutive_dns_failures < CONSECUTIVE_DNS_FAIL_THRESHOLD:
+            log.warning(
+                f"Primary DNS {PRIMARY_DNS} hiccup ({_consecutive_dns_failures}/"
+                f"{CONSECUTIVE_DNS_FAIL_THRESHOLD}): {reason}. Not triggering fix yet."
+            )
+            current_status = "Healthy"
+        else:
+            log.warning(
+                f"Primary DNS {PRIMARY_DNS} failed {_consecutive_dns_failures}x "
+                f"consecutively: {reason}"
+            )
+            _last_health_status = "DNS Unresponsive"
+            return False, "DNS Unresponsive"
+    else:
+        _consecutive_dns_failures = 0
+        current_status = "Healthy"
 
-    current_status = "Healthy"
     now = time.time()
     if current_status != _last_health_status or (
         now - _last_debug_log_time > DEBUG_LOG_MIN_INTERVAL
@@ -200,6 +212,7 @@ def check_health_scutil():
         log.debug("All scutil health checks passed")
         _last_debug_log_time = now
         _last_health_status = current_status
+        _consecutive_dns_failures = 0
 
     return True, current_status
 
@@ -607,6 +620,7 @@ def main():
         f"speed_rolling_window={SPEED_ROLLING_WINDOW}, "
         f"min_valid_elapsed={SPEED_TEST_MIN_VALID_ELAPSED}s, "
         f"consecutive_zero_threshold={CONSECUTIVE_ZERO_THRESHOLD}, "
+        f"consecutive_dns_fail_threshold={CONSECUTIVE_DNS_FAIL_THRESHOLD}, "
         f"primary_dns={PRIMARY_DNS}, fallback_dns={FALLBACK_DNS}, "
         f"dns_test_domain={DNS_TEST_DOMAIN}, "
         f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
