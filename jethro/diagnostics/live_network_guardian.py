@@ -704,24 +704,24 @@ def main():
                         f"Auto-fix paused. Still seeing '{status}'. "
                         "Manual intervention required."
                     )
-                elif consecutive_failures <= MAX_RETRIES:
-                    log.info(
-                        f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
-                    )
-                    fix_succeeded = apply_fix(status)
-                    last_fix_time = time.time()
+                # elif consecutive_failures <= MAX_RETRIES:
+                log.info(
+                    f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
+                )
+                fix_succeeded = apply_fix(status)
+                last_fix_time = time.time()
 
-                    if not fix_succeeded:
-                        log.warning(
-                            f"Fix for '{status}' reported failure. "
-                            f"Counting as attempt {consecutive_failures}/{MAX_RETRIES}."
-                        )
-                else:
-                    log.error(
-                        f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
-                        "Pausing auto-fix until network recovers."
+                if not fix_succeeded:
+                    log.warning(
+                        f"Fix for '{status}' reported failure. "
+                        f"Counting as attempt {consecutive_failures}/{MAX_RETRIES}."
                     )
-                    auto_fix_paused = True
+                # else:
+                #     log.error(
+                #         f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
+                #         "Pausing auto-fix until network recovers."
+                #     )
+                #     auto_fix_paused = True
 
             time.sleep(CHECK_INTERVAL)
 
