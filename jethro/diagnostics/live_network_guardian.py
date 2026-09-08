@@ -30,13 +30,14 @@ CHECK_IP = "8.8.8.8"
 CHECK_INTERVAL = 5
 SPEED_CHECK_INTERVAL = 15
 COOLDOWN_PERIOD = 15
+MAX_RETRIES = 3
 DEBUG_LOG_MIN_INTERVAL = 300
 INTERFACE_RECOVERY_TIMEOUT = 15
 
 LOG_DIR = "/Users/jethroestrada/Library/Logs"
 LOG_FILE = os.path.join(LOG_DIR, "live_network_guardian.log")
 
-SPEED_TEST_BYTES_NORMAL = 10_000_000
+SPEED_TEST_BYTES_NORMAL = 2_000_000
 SPEED_TEST_BYTES_DEGRADED = 500_000
 SPEED_DEGRADED_THRESHOLD = 0.3
 SPEED_TEST_PROGRESS_INTERVAL = 0.5
@@ -46,11 +47,11 @@ SPEED_TEST_MIN_VALID_ELAPSED = 0.5
 SPEED_TEST_MAX_DURATION_SEC = 15
 
 CONSECUTIVE_ZERO_THRESHOLD = 3
-CONSECUTIVE_DNS_FAIL_THRESHOLD = 2
 
 PRIMARY_DNS = "1.1.1.1"
 FALLBACK_DNS = "8.8.8.8"
 DNS_QUERY_TIMEOUT = 3
+# ✅ FIX: Match exact domain used by speed test to avoid domain-specific DNS issues
 DNS_TEST_DOMAIN = "speed.cloudflare.com"
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -82,7 +83,6 @@ _last_health_status = None
 _last_debug_log_time = 0
 _speed_history = deque(maxlen=SPEED_ROLLING_WINDOW)
 _consecutive_zero_tests = 0
-_consecutive_dns_failures = 0
 _manual_speed_test_requested = False
 
 
@@ -117,6 +117,7 @@ def _is_valid_ipv4(s):
     """Validate string contains at least one valid IPv4 address (handles multi-line dig output)."""
     if not s or s.startswith(";"):
         return False
+    # ✅ FIX: Check first non-empty line instead of entire string
     first_line = s.strip().split("\n")[0].strip()
     return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", first_line))
 
@@ -135,10 +136,10 @@ def get_average_speed():
 def check_health_scutil():
     """
     Instant health check using scutil with smart debug logging.
+
     Includes live DNS query validation targeting the exact speed test domain.
-    Requires consecutive DNS failures before reporting unhealthy.
     """
-    global _last_health_status, _last_debug_log_time, _consecutive_dns_failures
+    global _last_health_status, _last_debug_log_time
 
     nwi = run_cmd("scutil --nwi", timeout=3)
     if nwi == "":
@@ -174,32 +175,24 @@ def check_health_scutil():
         timeout=5,
     )
 
-    # ✅ Require consecutive DNS failures to avoid transient timeout false positives
-    if not dns_test or not _is_valid_ipv4(dns_test):
-        _consecutive_dns_failures += 1
-        reason = (
-            "EMPTY response (timeout)"
-            if not dns_test
-            else f"invalid output: '{dns_test[:80]}'"
+    # ✅ ENHANCEMENT: Provide clear diagnostic message for empty vs invalid responses
+    if not dns_test:
+        log.warning(
+            f"Primary DNS {PRIMARY_DNS} returned EMPTY response for "
+            f"{DNS_TEST_DOMAIN} (timeout or no record)"
         )
+        _last_health_status = "DNS Unresponsive"
+        return False, "DNS Unresponsive"
 
-        if _consecutive_dns_failures < CONSECUTIVE_DNS_FAIL_THRESHOLD:
-            log.warning(
-                f"Primary DNS {PRIMARY_DNS} hiccup ({_consecutive_dns_failures}/"
-                f"{CONSECUTIVE_DNS_FAIL_THRESHOLD}): {reason}. Not triggering fix yet."
-            )
-            current_status = "Healthy"
-        else:
-            log.warning(
-                f"Primary DNS {PRIMARY_DNS} failed {_consecutive_dns_failures}x "
-                f"consecutively: {reason}"
-            )
-            _last_health_status = "DNS Unresponsive"
-            return False, "DNS Unresponsive"
-    else:
-        _consecutive_dns_failures = 0
-        current_status = "Healthy"
+    if not _is_valid_ipv4(dns_test):
+        log.warning(
+            f"Primary DNS {PRIMARY_DNS} not resolving {DNS_TEST_DOMAIN} "
+            f"(output: '{dns_test[:80]}')"
+        )
+        _last_health_status = "DNS Unresponsive"
+        return False, "DNS Unresponsive"
 
+    current_status = "Healthy"
     now = time.time()
     if current_status != _last_health_status or (
         now - _last_debug_log_time > DEBUG_LOG_MIN_INTERVAL
@@ -212,7 +205,6 @@ def check_health_scutil():
         log.debug("All scutil health checks passed")
         _last_debug_log_time = now
         _last_health_status = current_status
-        _consecutive_dns_failures = 0
 
     return True, current_status
 
@@ -220,7 +212,6 @@ def check_health_scutil():
 def _watch_speed_progress(tmp_path, stop_event, progress, task_id, total_bytes):
     last_bytes = 0
     last_time = time.time()
-    zero_snapshot_count = 0
 
     while not stop_event.is_set():
         time.sleep(SPEED_TEST_PROGRESS_INTERVAL)
@@ -240,17 +231,9 @@ def _watch_speed_progress(tmp_path, stop_event, progress, task_id, total_bytes):
                 completed=current_bytes,
                 description=f"[cyan]Downloading[/cyan] [green]{mbps} Mbps[/green]",
             )
-
-            # Only log zero-speed once to prevent log flooding during failed tests
-            if mbps == 0.0:
-                if zero_snapshot_count == 0:
-                    log.debug("Live speed snapshot: 0.0 Mbps (waiting for data...)")
-                zero_snapshot_count += 1
-            else:
-                zero_snapshot_count = 0
-                log.debug(
-                    f"Live speed snapshot: {mbps} Mbps ({current_bytes // 1000} KB downloaded)"
-                )
+            log.debug(
+                f"Live speed snapshot: {mbps} Mbps ({current_bytes // 1000} KB downloaded)"
+            )
 
         last_bytes = current_bytes
         last_time = now
@@ -319,7 +302,7 @@ def check_speed_live():
                     "-H",
                     "Pragma: no-cache",
                     "--no-sessionid",
-                    "-4",
+                    "-4",  # ✅ FIX: Force IPv4 to prevent AAAA timeout masking
                     url,
                 ],
                 capture_output=True,
@@ -345,6 +328,7 @@ def check_speed_live():
             _consecutive_zero_tests += 1
             test_valid = False
 
+            # ✅ FIX: IP-direct retry with proper dig output validation
             if (
                 "Resolving timed out" in curl_stderr
                 or "Could not resolve host" in curl_stderr
@@ -472,6 +456,7 @@ def apply_fix(issue_type):
 
     log.warning(f"Applying targeted fix for: {issue_type}")
 
+    # ✅ Universal pre-fix: DNS flush (matches user's first manual step)
     log.info("Pre-fix: Flushing DNS cache and restarting mDNSResponder...")
     run_cmd("dscacheutil -flushcache", timeout=5)
     run_cmd("killall -HUP mDNSResponder", timeout=5)
@@ -488,6 +473,8 @@ def apply_fix(issue_type):
             timeout=5,
         )
         if _is_valid_ipv4(fallback_test):
+            # ✅ FIX: Fallback works but primary is broken → cache flush isn't enough
+            # Must escalate to full recovery to restore primary DNS path
             log.warning(
                 f"Fallback DNS ({FALLBACK_DNS}) responding but primary "
                 f"{PRIMARY_DNS} is broken; escalating to full recovery..."
@@ -518,6 +505,7 @@ def apply_fix(issue_type):
         return False
 
     elif issue_type == "Connected No Data":
+        # ✅ Full recovery sequence matching user's manual workflow
         log.info("Applying full recovery sequence for connectivity blackhole...")
         _apply_full_recovery_sequence()
         return True
@@ -542,10 +530,17 @@ def apply_fix(issue_type):
 
 def _apply_full_recovery_sequence():
     """
-    Encapsulates user's proven manual fix workflow using correct INTERFACE.
+    ✅ Encapsulates user's proven manual fix workflow using correct INTERFACE.
+    Equivalent to:
+      sudo killall -HUP mDNSResponder
+      sudo ipconfig set en1 DHCP
+      sudo networksetup -setairportpower en1 off
+      sleep 10
+      sudo networksetup -setairportpower en1 on
     """
     global _consecutive_zero_tests
 
+    # Step 1: DHCP renewal (safe check for static IP)
     dhcp_status = run_cmd(f"ipconfig getpacket {INTERFACE}", timeout=5)
     if dhcp_status:
         log.info(f"Renewing DHCP lease on {INTERFACE}...")
@@ -554,11 +549,13 @@ def _apply_full_recovery_sequence():
     else:
         log.info(f"Static IP on {INTERFACE}; skipping DHCP renewal")
 
+    # Step 2: Power cycle with 10s wait (matches user's manual sleep 10)
     log.info(f"Power cycling {INTERFACE} (off → 10s wait → on)...")
     run_cmd(f"networksetup -setairportpower {INTERFACE} off", timeout=10)
     time.sleep(10)
     run_cmd(f"networksetup -setairportpower {INTERFACE} on", timeout=10)
 
+    # Step 3: Poll for recovery
     for i in range(INTERFACE_RECOVERY_TIMEOUT):
         time.sleep(1)
         nwi = run_cmd("scutil --nwi", timeout=3)
@@ -620,7 +617,6 @@ def main():
         f"speed_rolling_window={SPEED_ROLLING_WINDOW}, "
         f"min_valid_elapsed={SPEED_TEST_MIN_VALID_ELAPSED}s, "
         f"consecutive_zero_threshold={CONSECUTIVE_ZERO_THRESHOLD}, "
-        f"consecutive_dns_fail_threshold={CONSECUTIVE_DNS_FAIL_THRESHOLD}, "
         f"primary_dns={PRIMARY_DNS}, fallback_dns={FALLBACK_DNS}, "
         f"dns_test_domain={DNS_TEST_DOMAIN}, "
         f"debug_dump_interval={DEBUG_LOG_MIN_INTERVAL}s"
@@ -637,6 +633,7 @@ def main():
     log.debug("Keyboard listener thread started")
 
     consecutive_failures = 0
+    auto_fix_paused = False
     last_fix_time = 0
     last_speed_check = 0
 
@@ -644,7 +641,6 @@ def main():
         while True:
             current_time = time.time()
 
-            # Cooldown prevents fix spamming; safe replacement for auto_fix_paused
             if current_time - last_fix_time < COOLDOWN_PERIOD:
                 remaining = int(COOLDOWN_PERIOD - (current_time - last_fix_time))
                 console.print(f"[dim]Stabilizing... {remaining}s[/dim]", end="\r")
@@ -670,6 +666,8 @@ def main():
 
             is_healthy, status = check_health_scutil()
 
+            # ✅ DNS Unresponsive triggers IMMEDIATELY (no consecutive threshold needed)
+            # Connected No Data still requires consecutive threshold
             if is_healthy and _consecutive_zero_tests >= CONSECUTIVE_ZERO_THRESHOLD:
                 is_healthy = False
                 status = "Connected No Data"
@@ -689,27 +687,41 @@ def main():
 
             if is_healthy:
                 console.print("[green]✓[/green] Network Healthy", end="\r")
-                if consecutive_failures > 0:
+                if consecutive_failures > 0 or auto_fix_paused:
                     log.info(
-                        f"Network recovered after {consecutive_failures} failure(s)."
+                        f"Network recovered after {consecutive_failures} failure(s). "
+                        "Resuming auto-fix."
                     )
                 consecutive_failures = 0
+                auto_fix_paused = False
             else:
                 console.print(f"\n[red]✗[/red] {status}")
                 log.warning(f"Health check failed: {status}")
                 consecutive_failures += 1
 
-                # Always attempt fix; COOLDOWN_PERIOD at top of loop prevents spam
-                log.info(
-                    f"Applying fix for '{status}' (Consecutive failures: {consecutive_failures})"
-                )
-                fix_succeeded = apply_fix(status)
-                last_fix_time = time.time()
-
-                if not fix_succeeded:
-                    log.warning(
-                        f"Fix for '{status}' reported failure. Will retry after cooldown."
+                if auto_fix_paused:
+                    log.error(
+                        f"Auto-fix paused. Still seeing '{status}'. "
+                        "Manual intervention required."
                     )
+                elif consecutive_failures <= MAX_RETRIES:
+                    log.info(
+                        f"Attempt {consecutive_failures}/{MAX_RETRIES} to fix '{status}'"
+                    )
+                    fix_succeeded = apply_fix(status)
+                    last_fix_time = time.time()
+
+                    if not fix_succeeded:
+                        log.warning(
+                            f"Fix for '{status}' reported failure. "
+                            f"Counting as attempt {consecutive_failures}/{MAX_RETRIES}."
+                        )
+                else:
+                    log.error(
+                        f"Max retries ({MAX_RETRIES}) reached for '{status}'. "
+                        "Pausing auto-fix until network recovers."
+                    )
+                    auto_fix_paused = True
 
             time.sleep(CHECK_INTERVAL)
 
