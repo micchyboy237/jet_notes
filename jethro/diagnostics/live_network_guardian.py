@@ -448,15 +448,11 @@ def check_speed_live():
 
 
 def apply_fix(issue_type):
-    """
-    Targeted fix matching user's proven manual workflow.
-    Uses correct INTERFACE variable throughout.
-    """
     global _consecutive_zero_tests
 
     log.warning(f"Applying targeted fix for: {issue_type}")
 
-    # ✅ Universal pre-fix: DNS flush (matches user's first manual step)
+    # ✅ Universal pre-fix: DNS flush (handles transient DNS issues automatically)
     log.info("Pre-fix: Flushing DNS cache and restarting mDNSResponder...")
     run_cmd("dscacheutil -flushcache", timeout=5)
     run_cmd("killall -HUP mDNSResponder", timeout=5)
@@ -466,28 +462,9 @@ def apply_fix(issue_type):
         time.sleep(5)
         return False
 
-    elif issue_type == "DNS Unresponsive":
-        log.info(f"Testing fallback DNS ({FALLBACK_DNS})...")
-        fallback_test = run_cmd(
-            f"dig +short +time={DNS_QUERY_TIMEOUT} +tries=1 -4 google.com @{FALLBACK_DNS}",
-            timeout=5,
-        )
-        if _is_valid_ipv4(fallback_test):
-            # ✅ FIX: Fallback works but primary is broken → cache flush isn't enough
-            # Must escalate to full recovery to restore primary DNS path
-            log.warning(
-                f"Fallback DNS ({FALLBACK_DNS}) responding but primary "
-                f"{PRIMARY_DNS} is broken; escalating to full recovery..."
-            )
-            _apply_full_recovery_sequence()
-            return True
-        else:
-            log.warning(
-                f"Both DNS servers unresponsive; applying full recovery sequence "
-                f"on {INTERFACE}..."
-            )
-            _apply_full_recovery_sequence()
-            return True
+    # ✅ REMOVED: "DNS Unresponsive" branch
+    # DNS-only issues now self-correct via pre-fix flush + next-cycle recheck
+    # Persistent DNS failures escalate naturally via "Connected No Data" path
 
     elif issue_type in ("Interface Missing", "Speed Degraded"):
         log.info(f"Cycling power on {INTERFACE}...")
@@ -505,7 +482,6 @@ def apply_fix(issue_type):
         return False
 
     elif issue_type == "Connected No Data":
-        # ✅ Full recovery sequence matching user's manual workflow
         log.info("Applying full recovery sequence for connectivity blackhole...")
         _apply_full_recovery_sequence()
         return True
