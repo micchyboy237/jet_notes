@@ -46,7 +46,7 @@ SPEED_ROLLING_WINDOW = 3
 SPEED_TEST_MIN_VALID_ELAPSED = 0.5
 SPEED_TEST_MAX_DURATION_SEC = 15
 
-CONSECUTIVE_ZERO_THRESHOLD = 3
+CONSECUTIVE_ZERO_THRESHOLD = 1
 
 PRIMARY_DNS = "1.1.1.1"
 FALLBACK_DNS = "8.8.8.8"
@@ -481,13 +481,16 @@ def apply_fix(issue_type):
             )
             _apply_full_recovery_sequence()
             return True
-        else:
+        elif _consecutive_zero_tests >= CONSECUTIVE_ZERO_THRESHOLD:
             log.warning(
                 f"Both DNS servers unresponsive; applying full recovery sequence "
                 f"on {INTERFACE}..."
             )
             _apply_full_recovery_sequence()
             return True
+        else:
+            log.warning(f"Both DNS servers unresponsive;")
+            return False
 
     elif issue_type in ("Interface Missing", "Speed Degraded"):
         log.info(f"Cycling power on {INTERFACE}...")
@@ -670,7 +673,7 @@ def main():
             # Connected No Data still requires consecutive threshold
             if is_healthy and _consecutive_zero_tests >= CONSECUTIVE_ZERO_THRESHOLD:
                 is_healthy = False
-                status = "Connected No Data"
+                # status = "Connected No Data"
                 log.warning(
                     f"L3/L4 healthy but {_consecutive_zero_tests} consecutive speed tests "
                     f"returned 0 bytes. Connectivity blackhole detected."
