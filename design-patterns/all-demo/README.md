@@ -33,10 +33,12 @@
 Each file is self-contained and includes a `__main__` block for easy testing.
 
 ```bash
+# Test the Singleton pattern for resource management
+python creational/singleton_pattern.py
 # Test the Observability Decorator for AI tracing
 python structural/observability_decorator.py
-# Test the Facade pattern for simplified subsystem access
-python structural/facade_pattern.py
+# Test the Chain of Responsibility for data pipelines
+python behavioral/chain_of_responsibility.py
 # Test the Object Pool for efficient resource reuse
 python resource/object_pool_pattern.py
 ```
