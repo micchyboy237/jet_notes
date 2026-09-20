@@ -50,49 +50,66 @@ def transaction(conn):
 
 def retry_on_failure(max_retries=3, delay=1):
     """
-    Factory function that returns a context manager for retrying operations.
+    Decorator-based retry mechanism.
 
-    Note: This is NOT a @contextmanager decorator because retry logic
-    doesn't fit the generator pattern well. Instead, we return a class-based
-    context manager.
+    Note: Retry logic is better implemented as a decorator rather than
+    a context manager, since retries need to re-execute code multiple times.
+    Context managers are for resource lifecycle (setup → use → cleanup),
+    not for repeating operations.
     """
     import time
+    from functools import wraps
 
-    class RetryContext:
-        def __init__(self, max_retries, delay):
-            self.max_retries = max_retries
-            self.delay = delay
-            self.attempts = 0
-            self.last_exception = None
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    logger.warning(f"Attempt {attempt}/{max_retries} failed: {e}")
+                    if attempt < max_retries:
+                        logger.info(f"Retrying in {delay} seconds...")
+                        time.sleep(delay)
+            raise last_exception
 
-        def __enter__(self):
-            return self
+        return wrapper
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if exc_type is None:
-                # No exception occurred
-                return False
+    return decorator
 
-            # An exception occurred - should we retry?
-            self.attempts += 1
-            self.last_exception = exc_val
 
-            if self.attempts < self.max_retries:
-                logger.warning(
-                    f"Attempt {self.attempts}/{self.max_retries} failed: {exc_val}"
-                )
-                logger.info(f"Retrying in {self.delay} seconds...")
-                time.sleep(self.delay)
-                # Return True to suppress the exception and retry
-                return True
-            else:
-                logger.warning(
-                    f"Attempt {self.attempts}/{self.max_retries} failed: {exc_val}"
-                )
-                # Return False to propagate the exception
-                return False
+class RetryManager:
+    """
+    A manager class that helps with retry logic.
+    Usage: Call execute() with a callable.
 
-    return RetryContext(max_retries, delay)
+    This is an alternative to the decorator approach when you need
+    more flexibility or want to reuse retry configuration.
+    """
+
+    def __init__(self, max_retries=3, delay=1):
+        self.max_retries = max_retries
+        self.delay = delay
+
+    def execute(self, func, *args, **kwargs):
+        """Execute a function with retry logic."""
+        import time
+
+        last_exception = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                logger.warning(f"Attempt {attempt}/{self.max_retries} failed: {e}")
+                if attempt < self.max_retries:
+                    logger.info(f"Retrying in {self.delay} seconds...")
+                    time.sleep(self.delay)
+
+        raise last_exception
 
 
 @contextmanager
@@ -149,10 +166,12 @@ if __name__ == "__main__":
     print("DEMO 2: Retry on Failure")
     print("=" * 60)
 
-    # Fixed: Use class-based approach for retry logic
+    # Approach 1: Using decorator
+    print("  --- Approach 1: Decorator-based Retry ---")
     attempt_counter = {"count": 0}
 
-    def flaky_operation():
+    @retry_on_failure(max_retries=3, delay=0.1)
+    def flaky_operation_decorated():
         attempt_counter["count"] += 1
         print(f"  • Attempting operation (attempt {attempt_counter['count']})")
         if attempt_counter["count"] < 3:
@@ -162,11 +181,32 @@ if __name__ == "__main__":
         return "Success!"
 
     try:
-        with retry_on_failure(max_retries=3, delay=0.1) as retry_ctx:
-            result = flaky_operation()
-            print(f"  • Result: {result}")
+        result = flaky_operation_decorated()
+        print(f"  • Result: {result}")
     except Exception as e:
         print(f"  • All retries failed: {e}")
+
+    # Approach 2: Using RetryManager
+    print("\n  --- Approach 2: RetryManager Class ---")
+    attempt_counter2 = {"count": 0}
+
+    def another_flaky_operation():
+        attempt_counter2["count"] += 1
+        print(f"  • Attempting operation (attempt {attempt_counter2['count']})")
+        if attempt_counter2["count"] < 2:
+            raise TimeoutError(f"Timeout (attempt {attempt_counter2['count']})")
+        return "Completed!"
+
+    retry_mgr = RetryManager(max_retries=3, delay=0.1)
+    try:
+        result = retry_mgr.execute(another_flaky_operation)
+        print(f"  • Result: {result}")
+    except Exception as e:
+        print(f"  • All retries failed: {e}")
+
+    print("\n  💡 Key Insight: Retry logic is NOT a good fit for context managers!")
+    print("     Context managers handle resource lifecycle (setup → use → cleanup)")
+    print("     Retries need to re-execute code, which requires decorators or loops")
 
     print("\n" + "=" * 60)
     print("DEMO 3: Multiple Resources with ExitStack")
