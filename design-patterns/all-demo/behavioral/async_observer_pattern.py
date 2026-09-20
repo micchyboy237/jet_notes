@@ -7,7 +7,7 @@ Industry-standard improvements over basic Observer pattern:
 - Async/concurrent handler execution for better performance
 - Type-safe generics (EventBus[T]) with TypedDict for strict payload validation
 - Fault isolation: one failing handler doesn't break others
-- Clean decorator-based registration syntax
+- Clean decorator-based registration syntax using 'subscribe'
 - Comprehensive logging for debugging and monitoring
 """
 
@@ -17,6 +17,11 @@ from typing import Any, Callable, Dict, List, NotRequired
 
 from typing_extensions import TypedDict
 
+# Configure logging at the module level to catch decorator-time logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -44,7 +49,7 @@ class EventBus[T]:
         # Map event types to list of handlers
         self._handlers: Dict[str, List[Callable[[T], Any]]] = {}
 
-    def on(self, event_type: str):
+    def subscribe(self, event_type: str):
         """Decorator to register a handler for an event type"""
 
         def decorator(func: Callable[[T], Any]):
@@ -89,13 +94,13 @@ order_bus = EventBus[OrderCreatedPayload]()
 # --- Global Handler Definitions with Decorators ---
 
 
-@user_bus.on("user.signup")
+@user_bus.subscribe("user.signup")
 def send_welcome_email(data: UserSignupPayload):
     """Simulate sending a welcome email"""
     print(f"📧 Sending welcome email to {data['username']} ({data['email']})")
 
 
-@user_bus.on("user.signup")
+@user_bus.subscribe("user.signup")
 async def update_analytics(data: UserSignupPayload):
     """Simulate async analytics tracking"""
     await asyncio.sleep(0.1)  # Simulate network delay
@@ -103,26 +108,26 @@ async def update_analytics(data: UserSignupPayload):
     print(f"📊 Tracking signup: user_id={data['user_id']}, source={source}")
 
 
-@user_bus.on("user.signup")
+@user_bus.subscribe("user.signup")
 def notify_slack(data: UserSignupPayload):
     """Simulate Slack notification"""
     print(f"💬 Slack notification: New user {data['username']} signed up!")
 
 
-@user_bus.on("user.signup")
+@user_bus.subscribe("user.signup")
 def failing_handler(data: UserSignupPayload):
     """Simulate a handler that fails to test error isolation"""
     raise ValueError("This handler intentionally fails!")
 
 
-@order_bus.on("order.created")
+@order_bus.subscribe("order.created")
 async def process_payment(data: OrderCreatedPayload):
     """Simulate async payment processing"""
     await asyncio.sleep(0.2)  # Simulate payment gateway delay
     print(f"💳 Processing payment: ${data['amount']:.2f} for order #{data['order_id']}")
 
 
-@order_bus.on("order.created")
+@order_bus.subscribe("order.created")
 def send_confirmation(data: OrderCreatedPayload):
     """Simulate sending order confirmation"""
     print(f"📧 Order confirmation sent to {data['customer_email']}")
@@ -131,11 +136,6 @@ def send_confirmation(data: OrderCreatedPayload):
 # --- Demo Execution ---
 
 if __name__ == "__main__":
-    # Configure logging to see the output
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
 
     async def run_demo():
         print("=" * 60)
