@@ -48,27 +48,51 @@ def transaction(conn):
         raise
 
 
-@contextmanager
 def retry_on_failure(max_retries=3, delay=1):
-    """Context manager that retries operations on failure."""
+    """
+    Factory function that returns a context manager for retrying operations.
+
+    Note: This is NOT a @contextmanager decorator because retry logic
+    doesn't fit the generator pattern well. Instead, we return a class-based
+    context manager.
+    """
     import time
 
-    attempts = 0
-    last_exception = None
+    class RetryContext:
+        def __init__(self, max_retries, delay):
+            self.max_retries = max_retries
+            self.delay = delay
+            self.attempts = 0
+            self.last_exception = None
 
-    while attempts < max_retries:
-        try:
-            yield
-            return  # Success, exit early
-        except Exception as e:
-            attempts += 1
-            last_exception = e
-            logger.warning(f"Attempt {attempts}/{max_retries} failed: {e}")
-            if attempts < max_retries:
-                logger.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
+        def __enter__(self):
+            return self
 
-    raise last_exception
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                # No exception occurred
+                return False
+
+            # An exception occurred - should we retry?
+            self.attempts += 1
+            self.last_exception = exc_val
+
+            if self.attempts < self.max_retries:
+                logger.warning(
+                    f"Attempt {self.attempts}/{self.max_retries} failed: {exc_val}"
+                )
+                logger.info(f"Retrying in {self.delay} seconds...")
+                time.sleep(self.delay)
+                # Return True to suppress the exception and retry
+                return True
+            else:
+                logger.warning(
+                    f"Attempt {self.attempts}/{self.max_retries} failed: {exc_val}"
+                )
+                # Return False to propagate the exception
+                return False
+
+    return RetryContext(max_retries, delay)
 
 
 @contextmanager
@@ -125,11 +149,12 @@ if __name__ == "__main__":
     print("DEMO 2: Retry on Failure")
     print("=" * 60)
 
-    # Fixed: Use a mutable container instead of nonlocal
+    # Fixed: Use class-based approach for retry logic
     attempt_counter = {"count": 0}
 
     def flaky_operation():
         attempt_counter["count"] += 1
+        print(f"  • Attempting operation (attempt {attempt_counter['count']})")
         if attempt_counter["count"] < 3:
             raise ConnectionError(
                 f"Connection failed (attempt {attempt_counter['count']})"
@@ -137,7 +162,7 @@ if __name__ == "__main__":
         return "Success!"
 
     try:
-        with retry_on_failure(max_retries=3, delay=0.1):
+        with retry_on_failure(max_retries=3, delay=0.1) as retry_ctx:
             result = flaky_operation()
             print(f"  • Result: {result}")
     except Exception as e:
