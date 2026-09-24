@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_system_info.sh
+# Run-SystemInfo.sh
 # Continuously display GPU, system RAM, and disk information in aligned format with color-coded output
 # Colors are usage-based: Green = low load/high remaining, Yellow = moderate, Red = high/critical/low remaining
 # Compatible with Mac M1 (Apple Silicon) and Intel Macs
@@ -27,10 +27,17 @@ COLOR_GRAY="\033[0;90m"
 
 # Function to get color based on usage percentage
 get_usage_color() {
-    local percent=$1
-    if (( $(echo "$percent >= $RED_THRESHOLD" | bc -l) )); then
+    local percent="$1"
+    
+    # Handle empty or invalid input
+    if [ -z "$percent" ] || ! [[ "$percent" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "$COLOR_GREEN"
+        return
+    fi
+    
+    if (( $(echo "$percent >= $RED_THRESHOLD" | bc -l 2>/dev/null || echo "0") )); then
         echo "$COLOR_RED"
-    elif (( $(echo "$percent >= $YELLOW_THRESHOLD" | bc -l) )); then
+    elif (( $(echo "$percent >= $YELLOW_THRESHOLD" | bc -l 2>/dev/null || echo "0") )); then
         echo "$COLOR_YELLOW"
     else
         echo "$COLOR_GREEN"
@@ -47,31 +54,66 @@ pad_string() {
 # Function to get CPU usage
 get_cpu_usage() {
     # Get CPU usage from top command (one iteration)
-    local cpu_idle=$(top -l 1 | grep "CPU usage" | awk '{print $7}' | sed 's/%//')
-    if [ -z "$cpu_idle" ]; then
-        cpu_idle=0
+    local cpu_line=$(top -l 1 | grep "CPU usage")
+    if [ -z "$cpu_line" ]; then
+        echo "0.00"
+        return
     fi
-    local cpu_usage=$(echo "100 - $cpu_idle" | bc -l)
+    
+    local cpu_idle=$(echo "$cpu_line" | awk '{for(i=1;i<=NF;i++) if($i ~ /idle/) print $(i-1)}' | sed 's/%//')
+    if [ -z "$cpu_idle" ] || ! [[ "$cpu_idle" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "0.00"
+        return
+    fi
+    
+    local cpu_usage=$(echo "100 - $cpu_idle" | bc -l 2>/dev/null)
+    if [ -z "$cpu_usage" ]; then
+        echo "0.00"
+        return
+    fi
+    
     printf "%.2f" "$cpu_usage"
 }
 
 # Function to get system RAM info
 get_system_ram_info() {
     # Get total physical memory in GB
-    local total_mem_bytes=$(sysctl -n hw.memsize)
-    local total_mem_gb=$(echo "scale=2; $total_mem_bytes / 1073741824" | bc)
+    local total_mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
+    if [ -z "$total_mem_bytes" ] || ! [[ "$total_mem_bytes" =~ ^[0-9]+$ ]]; then
+        echo "0|System RAM|CPU: 0.00%|Mem: 0.00 GB  /  0.00 GB"
+        return
+    fi
+    
+    local total_mem_gb=$(echo "scale=2; $total_mem_bytes / 1073741824" | bc -l 2>/dev/null)
+    if [ -z "$total_mem_gb" ]; then
+        total_mem_gb="0.00"
+    fi
     
     # Get used memory using vm_stat
-    local pages_free=$(vm_stat | grep "Pages free" | awk '{print $3}' | sed 's/\.//')
-    local pages_active=$(vm_stat | grep "Pages active" | awk '{print $3}' | sed 's/\.//')
-    local pages_inactive=$(vm_stat | grep "Pages inactive" | awk '{print $3}' | sed 's/\.//')
-    local pages_wired=$(vm_stat | grep "Pages wired down" | awk '{print $4}' | sed 's/\.//')
-    local page_size=$(pagesize)
+    local vm_stat_output=$(vm_stat 2>/dev/null)
+    if [ -z "$vm_stat_output" ]; then
+        echo "0|System RAM|CPU: 0.00%|Mem: 0.00 GB  /  ${total_mem_gb} GB"
+        return
+    fi
+    
+    local pages_free=$(echo "$vm_stat_output" | grep "Pages free" | awk '{print $3}' | sed 's/\.//')
+    local pages_active=$(echo "$vm_stat_output" | grep "Pages active" | awk '{print $3}' | sed 's/\.//')
+    local pages_wired=$(echo "$vm_stat_output" | grep "Pages wired down" | awk '{print $4}' | sed 's/\.//')
+    
+    # Validate numeric values
+    pages_free=${pages_free:-0}
+    pages_active=${pages_active:-0}
+    pages_wired=${pages_wired:-0}
+    
+    local page_size=$(pagesize 2>/dev/null || echo "4096")
     
     # Calculate used memory (active + wired)
     local used_pages=$((pages_active + pages_wired))
     local used_mem_bytes=$((used_pages * page_size))
-    local used_mem_gb=$(echo "scale=2; $used_mem_bytes / 1073741824" | bc)
+    local used_mem_gb=$(echo "scale=2; $used_mem_bytes / 1073741824" | bc -l 2>/dev/null)
+    if [ -z "$used_mem_gb" ]; then
+        used_mem_gb="0.00"
+    fi
     
     # Get CPU usage
     local cpu_usage=$(get_cpu_usage)
@@ -82,93 +124,118 @@ get_system_ram_info() {
 # Function to get disk info
 get_disk_info() {
     # Get disk usage for root partition (/)
-    local disk_info=$(df -h / | tail -1)
+    local disk_info=$(df -h / 2>/dev/null | tail -1)
+    if [ -z "$disk_info" ]; then
+        echo "1|System Disk|Usage: 0%|Mem: 0 Gi  /  0 Gi"
+        return
+    fi
+    
     local total_disk=$(echo "$disk_info" | awk '{print $2}')
     local used_disk=$(echo "$disk_info" | awk '{print $3}')
     local avail_disk=$(echo "$disk_info" | awk '{print $4}')
     local use_percent=$(echo "$disk_info" | awk '{print $5}' | sed 's/%//')
+    
+    # Validate
+    total_disk=${total_disk:-"0 Gi"}
+    used_disk=${used_disk:-"0 Gi"}
+    use_percent=${use_percent:-0}
     
     echo "1|System Disk|Usage: ${use_percent}%|Mem: ${used_disk}  /  ${total_disk}"
 }
 
 # Function to get GPU info (Apple Silicon)
 get_gpu_info() {
-    # For Apple Silicon, GPU shares unified memory with CPU
-    # We can get basic GPU info from system_profiler
-    
     local gpu_name=""
-    local chip_type=$(sysctl -n machdep.cpu.brand_string)
+    local chip_type=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
     
     if [[ "$chip_type" == *"Apple"* ]]; then
         # Apple Silicon
         gpu_name="Apple GPU (Unified Memory)"
-        
-        # Try to get GPU utilization using powermetrics (requires sudo)
-        # Alternative: Use simplified approach without sudo
-        local gpu_util="N/A"
-        
-        # Get unified memory stats (same as system RAM for Apple Silicon)
-        local total_mem_bytes=$(sysctl -n hw.memsize)
-        local total_mem_gb=$(echo "scale=2; $total_mem_bytes / 1073741824" | bc)
-        
-        local pages_free=$(vm_stat | grep "Pages free" | awk '{print $3}' | sed 's/\.//')
-        local pages_active=$(vm_stat | grep "Pages active" | awk '{print $3}' | sed 's/\.//')
-        local pages_wired=$(vm_stat | grep "Pages wired down" | awk '{print $4}' | sed 's/\.//')
-        local page_size=$(pagesize)
-        
-        local used_pages=$((pages_active + pages_wired))
-        local used_mem_bytes=$((used_pages * page_size))
-        local used_mem_gb=$(echo "scale=2; $used_mem_bytes / 1073741824" | bc)
-        
-        echo "2|${gpu_name}|GPU: N/A|Mem: ${used_mem_gb} GB  /  ${total_mem_gb} GB"
     else
         # Intel Mac with dedicated GPU
-        gpu_name=$(system_profiler SPDisplaysDataType | grep "Chipset Model" | head -1 | awk -F': ' '{print $2}' | xargs)
+        gpu_name=$(system_profiler SPDisplaysDataType 2>/dev/null | grep "Chipset Model" | head -1 | awk -F': ' '{print $2}' | xargs)
         
         if [ -z "$gpu_name" ]; then
             gpu_name="Intel Integrated GPU"
         fi
-        
-        # Intel Macs also use unified/shared memory typically
-        local total_mem_bytes=$(sysctl -n hw.memsize)
-        local total_mem_gb=$(echo "scale=2; $total_mem_bytes / 1073741824" | bc)
-        
-        local pages_free=$(vm_stat | grep "Pages free" | awk '{print $3}' | sed 's/\.//')
-        local pages_active=$(vm_stat | grep "Pages active" | awk '{print $3}' | sed 's/\.//')
-        local pages_wired=$(vm_stat | grep "Pages wired down" | awk '{print $4}' | sed 's/\.//')
-        local page_size=$(pagesize)
-        
-        local used_pages=$((pages_active + pages_wired))
-        local used_mem_bytes=$((used_pages * page_size))
-        local used_mem_gb=$(echo "scale=2; $used_mem_bytes / 1073741824" | bc)
-        
-        echo "2|${gpu_name}|GPU: N/A|Mem: ${used_mem_gb} GB  /  ${total_mem_gb} GB"
     fi
+    
+    # Get unified memory stats (same as system RAM for Apple Silicon)
+    local total_mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
+    if [ -z "$total_mem_bytes" ] || ! [[ "$total_mem_bytes" =~ ^[0-9]+$ ]]; then
+        echo "2|${gpu_name}|GPU: N/A|Mem: 0.00 GB  /  0.00 GB"
+        return
+    fi
+    
+    local total_mem_gb=$(echo "scale=2; $total_mem_bytes / 1073741824" | bc -l 2>/dev/null)
+    if [ -z "$total_mem_gb" ]; then
+        total_mem_gb="0.00"
+    fi
+    
+    # Get used memory using vm_stat
+    local vm_stat_output=$(vm_stat 2>/dev/null)
+    if [ -z "$vm_stat_output" ]; then
+        echo "2|${gpu_name}|GPU: N/A|Mem: 0.00 GB  /  ${total_mem_gb} GB"
+        return
+    fi
+    
+    local pages_active=$(echo "$vm_stat_output" | grep "Pages active" | awk '{print $3}' | sed 's/\.//')
+    local pages_wired=$(echo "$vm_stat_output" | grep "Pages wired down" | awk '{print $4}' | sed 's/\.//')
+    
+    pages_active=${pages_active:-0}
+    pages_wired=${pages_wired:-0}
+    
+    local page_size=$(pagesize 2>/dev/null || echo "4096")
+    
+    local used_pages=$((pages_active + pages_wired))
+    local used_mem_bytes=$((used_pages * page_size))
+    local used_mem_gb=$(echo "scale=2; $used_mem_bytes / 1073741824" | bc -l 2>/dev/null)
+    if [ -z "$used_mem_gb" ]; then
+        used_mem_gb="0.00"
+    fi
+    
+    echo "2|${gpu_name}|GPU: N/A|Mem: ${used_mem_gb} GB  /  ${total_mem_gb} GB"
 }
 
 # Function to extract numeric value from percentage string
 extract_percent() {
     local str="$1"
-    echo "$str" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1
+    local result=$(echo "$str" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+    if [ -z "$result" ]; then
+        echo "0"
+    else
+        echo "$result"
+    fi
 }
 
 # Function to extract memory values and calculate remaining
 parse_memory_info() {
     local mem_str="$1"
+    
     # Format: "Mem: X.XX GB  /  Y.YY GB" or "Mem: X.XX Gi  /  Y.YY Gi"
-    local used=$(echo "$mem_str" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
-    local total=$(echo "$mem_str" | grep -oE '[0-9]+(\.[0-9]+)?' | tail -1)
+    local numbers=($(echo "$mem_str" | grep -oE '[0-9]+(\.[0-9]+)?'))
     local unit=$(echo "$mem_str" | grep -oE '(GB|Gi|MB|Mi)' | head -1)
     
-    if [ -z "$used" ] || [ -z "$total" ]; then
-        echo "0|0|$unit"
+    if [ ${#numbers[@]} -lt 2 ]; then
+        echo "0|0|${unit:-GB}"
         return
     fi
     
-    local remaining=$(echo "scale=2; $total - $used" | bc)
-    local percent=0
-    if (( $(echo "$total > 0" | bc -l) )); then
-        percent=$(echo "scale=2; ($used / $total) * 100" | bc)
+    local used="${numbers[0]}"
+    local total="${numbers[1]}"
+    unit=${unit:-GB}
+    
+    local remaining=$(echo "scale=2; $total - $used" | bc -l 2>/dev/null)
+    if [ -z "$remaining" ]; then
+        remaining="0"
+    fi
+    
+    local percent="0"
+    if (( $(echo "$total > 0" | bc -l 2>/dev/null || echo "0") )); then
+        percent=$(echo "scale=2; ($used / $total) * 100" | bc -l 2>/dev/null)
+        if [ -z "$percent" ]; then
+            percent="0"
+        fi
     fi
     
     echo "${percent}|${remaining}|${unit}"
@@ -203,36 +270,29 @@ write_colored_output() {
     local rem_color=$(get_usage_color "$mem_percent")
     local rem_fmt=$(pad_string "$rem_text" $COL_REM_WIDTH)
     
-    # Write aligned colored output
-    printf "${COLOR_WHITE}%b${COLOR_RESET}" "$index_fmt"
-    printf "${COLOR_WHITE}%b${COLOR_RESET}" "$name_fmt"
-    printf "%b%b${COLOR_RESET}" "$util_color" "$util_fmt"
-    printf "%b%b${COLOR_RESET}" "$mem_color" "$mem_fmt"
-    printf "%b%b${COLOR_RESET}" "$rem_color" "$rem_fmt"
-    printf "\n"
+    # Write aligned colored output using echo -e for proper ANSI code interpretation
+    echo -ne "${COLOR_WHITE}${index_fmt}${COLOR_RESET}"
+    echo -ne "${COLOR_WHITE}${name_fmt}${COLOR_RESET}"
+    echo -ne "${util_color}${util_fmt}${COLOR_RESET}"
+    echo -ne "${mem_color}${mem_fmt}${COLOR_RESET}"
+    echo -e "${rem_color}${rem_fmt}${COLOR_RESET}"
 }
 
 # Clear screen and output header + legend once
 clear
 
-# Print header
-header=$(printf "%b%b%b%b%b" \
-    "$(pad_string "index" $COL_INDEX_WIDTH)" \
-    "$(pad_string "name" $COL_NAME_WIDTH)" \
-    "$(pad_string "utilization" $COL_UTIL_WIDTH)" \
-    "$(pad_string "memory" $COL_MEM_WIDTH)" \
-    "$(pad_string "remaining" $COL_REM_WIDTH)")
-printf "${COLOR_CYAN}%s${COLOR_RESET}\n" "$header"
+# Print header using echo -e for ANSI codes
+echo -e "${COLOR_CYAN}$(pad_string "index" $COL_INDEX_WIDTH)$(pad_string "name" $COL_NAME_WIDTH)$(pad_string "utilization" $COL_UTIL_WIDTH)$(pad_string "memory" $COL_MEM_WIDTH)$(pad_string "remaining" $COL_REM_WIDTH)${COLOR_RESET}"
 
-# Print legend
-printf "${COLOR_GRAY}Legend: ${COLOR_RESET}"
-printf "${COLOR_GREEN}Green${COLOR_RESET}"
-printf "${COLOR_GRAY} < ${YELLOW_THRESHOLD}%   ${COLOR_RESET}"
-printf "${COLOR_YELLOW}Yellow${COLOR_RESET}"
-printf "${COLOR_GRAY} ${YELLOW_THRESHOLD}-$((RED_THRESHOLD-1))%   ${COLOR_RESET}"
-printf "${COLOR_RED}Red${COLOR_RESET}"
-printf "${COLOR_GRAY} >= ${RED_THRESHOLD}%${COLOR_RESET}\n"
-printf "\n"
+# Print legend - escape the % signs properly
+echo -ne "${COLOR_GRAY}Legend: ${COLOR_RESET}"
+echo -ne "${COLOR_GREEN}Green${COLOR_RESET}"
+echo -ne "${COLOR_GRAY} < ${YELLOW_THRESHOLD}%%   ${COLOR_RESET}"
+echo -ne "${COLOR_YELLOW}Yellow${COLOR_RESET}"
+echo -ne "${COLOR_GRAY} ${YELLOW_THRESHOLD}-$((RED_THRESHOLD-1))%%   ${COLOR_RESET}"
+echo -ne "${COLOR_RED}Red${COLOR_RESET}"
+echo -e "${COLOR_GRAY} >= ${RED_THRESHOLD}%%${COLOR_RESET}"
+echo ""
 
 # Main loop
 while true; do
@@ -243,7 +303,7 @@ while true; do
     write_colored_output "$gpu_info"
     write_colored_output "$ram_info"
     write_colored_output "$disk_info"
-    printf "\n"
+    echo ""
     
     sleep "$REFRESH_INTERVAL"
 done
