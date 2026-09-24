@@ -212,33 +212,74 @@ extract_percent() {
 parse_memory_info() {
     local mem_str="$1"
     
-    # Format: "Mem: X.XX GB  /  Y.YY GB" or "Mem: X.XX Gi  /  Y.YY Gi"
-    local numbers=($(echo "$mem_str" | grep -oE '[0-9]+(\.[0-9]+)?'))
-    local unit=$(echo "$mem_str" | grep -oE '(GB|Gi|MB|Mi)' | head -1)
+    # Format examples:
+    # "Mem: 5.85 GB  /  16.00 GB"
+    # "Mem: 12Gi  /  228Gi"
     
-    if [ ${#numbers[@]} -lt 2 ]; then
-        echo "0|0|${unit:-GB}"
+    # Extract unit first
+    local unit=$(echo "$mem_str" | grep -oE '(GB|Gi|MB|Mi)' | head -1)
+    unit=${unit:-GB}
+    
+    # Extract all numbers from the string using awk for reliability
+    local used=""
+    local total=""
+    
+    # Use awk to extract the first two numbers
+    local numbers_output=$(echo "$mem_str" | awk '{
+        count = 0;
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+                count++;
+                if (count == 1) printf "%s ", $i;
+                if (count == 2) { printf "%s\n", $i; exit; }
+            }
+        }
+    }')
+    
+    # Parse the output
+    read -r used total <<< "$numbers_output"
+    
+    # Fallback: if awk didn't work, try manual extraction
+    if [ -z "$used" ] || [ -z "$total" ]; then
+        # Remove all non-numeric characters except dots and spaces
+        local cleaned=$(echo "$mem_str" | sed 's/[^0-9. ]//g' | tr -s ' ' | sed 's/^ //;s/ $//')
+        local numbers_array=($cleaned)
+        
+        if [ ${#numbers_array[@]} -ge 2 ]; then
+            used="${numbers_array[0]}"
+            total="${numbers_array[1]}"
+        fi
+    fi
+    
+    # Validate we have numbers
+    if [ -z "$used" ] || [ -z "$total" ]; then
+        echo "0|0|${unit}"
         return
     fi
     
-    local used="${numbers[0]}"
-    local total="${numbers[1]}"
-    unit=${unit:-GB}
-    
-    local remaining=$(echo "scale=2; $total - $used" | bc -l 2>/dev/null)
-    if [ -z "$remaining" ]; then
-        remaining="0"
+    # Validate numeric format
+    if ! [[ "$used" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$total" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "0|0|${unit}"
+        return
     fi
     
+    # Calculate remaining using awk for better reliability than bc
+    local remaining=$(awk "BEGIN {printf \"%.2f\", $total - $used}")
+    if [ -z "$remaining" ]; then
+        remaining="0.00"
+    fi
+    
+    # Calculate percentage using awk
     local percent="0"
-    if (( $(echo "$total > 0" | bc -l 2>/dev/null || echo "0") )); then
-        percent=$(echo "scale=2; ($used / $total) * 100" | bc -l 2>/dev/null)
+    if awk "BEGIN {exit !($total > 0)}" 2>/dev/null; then
+        percent=$(awk "BEGIN {printf \"%.2f\", ($used / $total) * 100}")
         if [ -z "$percent" ]; then
             percent="0"
         fi
     fi
     
-    echo "${percent}|${remaining}|${unit}"
+    # Ensure no trailing newline or extra spaces
+    echo "${percent}|${remaining}|${unit}" | tr -d '\n' | sed 's/[[:space:]]*$//'
 }
 
 # Function to display colored output with aligned columns
@@ -259,9 +300,19 @@ write_colored_output() {
     local util_color=$(get_usage_color "$util_percent")
     local util_fmt=$(pad_string "${util_label}: ${util_value}" $COL_UTIL_WIDTH)
     
-    # Parse memory
-    local mem_parts=$(parse_memory_info "$memory")
+    # Parse memory - call function and capture output
+    local mem_parts
+    mem_parts=$(parse_memory_info "$memory")
+    
+    # Split the returned values
+    local mem_percent mem_remaining mem_unit
     IFS='|' read -r mem_percent mem_remaining mem_unit <<< "$mem_parts"
+    
+    # Set defaults if parsing failed
+    mem_percent=${mem_percent:-0}
+    mem_remaining=${mem_remaining:-0}
+    mem_unit=${mem_unit:-GB}
+    
     local mem_color=$(get_usage_color "$mem_percent")
     local mem_fmt=$(pad_string "$memory" $COL_MEM_WIDTH)
     
@@ -284,14 +335,14 @@ clear
 # Print header using echo -e for ANSI codes
 echo -e "${COLOR_CYAN}$(pad_string "index" $COL_INDEX_WIDTH)$(pad_string "name" $COL_NAME_WIDTH)$(pad_string "utilization" $COL_UTIL_WIDTH)$(pad_string "memory" $COL_MEM_WIDTH)$(pad_string "remaining" $COL_REM_WIDTH)${COLOR_RESET}"
 
-# Print legend - escape the % signs properly
+# Print legend - use single % with echo (no escaping needed)
 echo -ne "${COLOR_GRAY}Legend: ${COLOR_RESET}"
 echo -ne "${COLOR_GREEN}Green${COLOR_RESET}"
-echo -ne "${COLOR_GRAY} < ${YELLOW_THRESHOLD}%%   ${COLOR_RESET}"
+echo -ne "${COLOR_GRAY} < ${YELLOW_THRESHOLD}%   ${COLOR_RESET}"
 echo -ne "${COLOR_YELLOW}Yellow${COLOR_RESET}"
-echo -ne "${COLOR_GRAY} ${YELLOW_THRESHOLD}-$((RED_THRESHOLD-1))%%   ${COLOR_RESET}"
+echo -ne "${COLOR_GRAY} ${YELLOW_THRESHOLD}-$((RED_THRESHOLD-1))%   ${COLOR_RESET}"
 echo -ne "${COLOR_RED}Red${COLOR_RESET}"
-echo -e "${COLOR_GRAY} >= ${RED_THRESHOLD}%%${COLOR_RESET}"
+echo -e "${COLOR_GRAY} >= ${RED_THRESHOLD}%${COLOR_RESET}"
 echo ""
 
 # Main loop
