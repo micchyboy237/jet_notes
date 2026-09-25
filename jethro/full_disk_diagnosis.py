@@ -122,10 +122,26 @@ class DiskDiagnoser:
             if result.returncode == 0:
                 return result.stdout.strip()
             else:
-                # Only warn if it's not a "no such file" due to empty glob
-                if "No such file or directory" not in result.stderr:
-                    logger.warning(f"Command failed: {cmd}")
-                    logger.warning(f"Error: {result.stderr.strip()}")
+                # Filter out common macOS permission errors to keep logs clean
+                stderr = result.stderr.strip()
+
+                # Ignore "Permission denied" and "Operation not permitted" for system paths
+                # These are expected on macOS due to SIP and Sandboxing
+                if stderr:
+                    is_expected_error = any(
+                        err in stderr
+                        for err in [
+                            "Permission denied",
+                            "Operation not permitted",
+                            "No such file or directory",
+                        ]
+                    )
+
+                    # Only warn if it's NOT a standard permission issue
+                    if not is_expected_error:
+                        logger.warning(f"Command failed: {cmd}")
+                        logger.warning(f"Error: {stderr}")
+
                 return None
         except subprocess.TimeoutExpired:
             logger.warning(f"Command timed out after {timeout}s: {cmd}")
