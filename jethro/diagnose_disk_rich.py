@@ -205,28 +205,37 @@ def main():
         )
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-        expand=True,
-    ) as progress:
-        tasks = [
-            progress.add_task("[cyan]Filesystem Analysis", total=1),
-            progress.add_task("[cyan]Home Directory Scan", total=1),
-            progress.add_task("[cyan]Dev Tools Check", total=1),
-            progress.add_task("[cyan]Large File Search", total=1),
-        ]
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            expand=True,
+        ) as progress:
+            tasks = [
+                progress.add_task("[cyan]Filesystem Analysis", total=1),
+                progress.add_task("[cyan]Home Directory Scan", total=1),
+                progress.add_task("[cyan]Dev Tools Check", total=1),
+                progress.add_task("[cyan]Large File Search", total=1),
+            ]
 
-        diagnose_filesystem(progress, tasks[0])
-        diagnose_top_directories(progress, tasks[1])
-        diagnose_dev_tools(progress, tasks[2])
-        diagnose_large_files(progress, tasks[3])
+            diagnose_filesystem(progress, tasks[0])
+            diagnose_top_directories(progress, tasks[1])
+            diagnose_dev_tools(progress, tasks[2])
+            diagnose_large_files(progress, tasks[3])
 
-    console.print("\n[bold green]✅ Diagnosis Complete![/bold green]")
-    console.print("Review the tables above to decide what to clean up.")
+        console.print("\n[bold green]✅ Diagnosis Complete![/bold green]")
+        console.print("Review the tables above to decide what to clean up.")
+
+    except KeyboardInterrupt:
+        console.print("\n[bold red]⚠️ Diagnostic interrupted.[/bold red]")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+    finally:
+        # Ensure terminal is left in a clean state
+        console.print("\n")
 
 
 if __name__ == "__main__":
