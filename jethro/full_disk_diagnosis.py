@@ -12,7 +12,51 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION SETTINGS
+# -----------------------------------------------------------------------------
+CONFIG = {
+    # Timeouts (in seconds)
+    "COMMAND_TIMEOUT": 300,  # General command timeout
+    "FOLDER_SIZE_TIMEOUT": 300,  # Timeout for individual folder size checks
+    "FIND_FILES_TIMEOUT": 300,  # Timeout for searching large files
+    # Scan Depth & Limits
+    "MAX_ROOT_ITEMS": 15,  # Number of root directories to show
+    "MAX_HOME_ITEMS": 20,  # Number of home directory items to show
+    "MAX_SUBFOLDER_ITEMS": 10,  # Number of subfolders to list per category
+    "FIND_MAX_DEPTH": 3,  # Max depth for 'find' command (prevents hanging on node_modules)
+    # Thresholds
+    "LARGE_FILE_SIZE_MB": 100,  # Minimum size (MB) to report in "Large Files" section
+    "CRITICAL_SPACE_GB": 10,  # Threshold for CRITICAL warning
+    "WARNING_SPACE_GB": 20,  # Threshold for WARNING status
+    # Paths to Skip during Root Scan (to avoid timeouts/SIP issues)
+    "SKIP_ROOT_DIRS": {
+        "/System",
+        "/Volumes",
+        "/dev",
+        "/proc",
+        "/private/var/folders",  # Often huge and protected
+    },
+    # Generic Dev Tool Indicators (Folder names to look for in Home Dir)
+    "DEV_TOOL_INDICATORS": [
+        ".npm",
+        ".yarn",
+        ".pnpm-store",
+        ".m2",
+        ".gradle",
+        ".cargo",
+        "go/pkg",
+        ".rustup",
+        ".docker",
+        ".conda",
+        ".local/share/pip",
+        "Library/Caches/pip",
+        "Library/Developer/Xcode",
+        "Library/Android/sdk",
+    ],
+}
 
 # Rich library for beautiful terminal output
 try:
@@ -89,15 +133,17 @@ class DiskDiagnoser:
         cmd: list | str,
         shell: bool = False,
         capture: bool = True,
-        timeout: int = 30,
+        timeout: int = None,
     ) -> Optional[str]:
         """Run shell command and return output"""
+        if timeout is None:
+            timeout = CONFIG["COMMAND_TIMEOUT"]
+
         try:
             # Handle wildcard expansion manually if not using shell
             if isinstance(cmd, list) and not shell:
                 has_wildcard = any("*" in str(c) for c in cmd)
                 if has_wildcard:
-                    # Convert to string and enable shell for this specific call
                     cmd_str = " ".join(str(c) for c in cmd)
                     result = subprocess.run(
                         cmd_str,
@@ -126,7 +172,6 @@ class DiskDiagnoser:
                 stderr = result.stderr.strip()
 
                 # Ignore "Permission denied" and "Operation not permitted" for system paths
-                # These are expected on macOS due to SIP and Sandboxing
                 if stderr:
                     is_expected_error = any(
                         err in stderr
@@ -137,7 +182,6 @@ class DiskDiagnoser:
                         ]
                     )
 
-                    # Only warn if it's NOT a standard permission issue
                     if not is_expected_error:
                         logger.warning(f"Command failed: {cmd}")
                         logger.warning(f"Error: {stderr}")
@@ -155,9 +199,9 @@ class DiskDiagnoser:
         if not path.exists():
             return "0B"
         try:
-            # Use maxdepth 1 to avoid hanging on deep nested structures during quick scan
-            # Actually, du -sh is recursive by default. Let's stick to it but with timeout.
-            result = self.run_command(["du", "-sh", str(path)], timeout=20)
+            result = self.run_command(
+                ["du", "-sh", str(path)], timeout=CONFIG["FOLDER_SIZE_TIMEOUT"]
+            )
             if result:
                 return result.split()[0]
             return "N/A"
@@ -165,9 +209,12 @@ class DiskDiagnoser:
             return "N/A"
 
     def get_subfolder_sizes(
-        self, parent_path: Path, limit: int = 10
+        self, parent_path: Path, limit: int = None
     ) -> List[Tuple[str, str]]:
         """Safely get sizes of immediate subfolders using iteration instead of wildcards"""
+        if limit is None:
+            limit = CONFIG["MAX_SUBFOLDER_ITEMS"]
+
         results = []
         if not parent_path.is_dir():
             return results
@@ -274,12 +321,10 @@ class DiskDiagnoser:
             try:
                 for entry in os.listdir("/"):
                     full_path = Path("/") / entry
-                    if full_path.is_dir() and entry not in [
-                        "System",
-                        "Volumes",
-                        "dev",
-                        "proc",
-                    ]:
+                    # Skip configured directories
+                    if str(full_path) in CONFIG["SKIP_ROOT_DIRS"]:
+                        continue
+                    if full_path.is_dir():
                         root_items.append(full_path)
             except PermissionError:
                 pass
@@ -318,7 +363,7 @@ class DiskDiagnoser:
             table.add_column("Path", style="white")
 
             report_lines = []
-            for size, path in results[:15]:
+            for size, path in results[: CONFIG["MAX_ROOT_ITEMS"]]:
                 table.add_row(size, path)
                 report_lines.append(f"{size}\t{path}")
 
@@ -340,15 +385,20 @@ class DiskDiagnoser:
             task = progress.add_task("Analyzing home directory...", total=None)
 
             # Use iterative approach instead of wildcard du
-            results = self.get_subfolder_sizes(self.home_dir, limit=20)
+            results = self.get_subfolder_sizes(
+                self.home_dir, limit=CONFIG["MAX_HOME_ITEMS"]
+            )
 
             # Also check hidden files/folders
             hidden_results = []
-            for entry in self.home_dir.iterdir():
-                if entry.name.startswith(".") and entry.is_dir():
-                    size = self.get_folder_size(entry)
-                    if size != "N/A":
-                        hidden_results.append((size, str(entry)))
+            try:
+                for entry in self.home_dir.iterdir():
+                    if entry.name.startswith(".") and entry.is_dir():
+                        size = self.get_folder_size(entry)
+                        if size != "N/A":
+                            hidden_results.append((size, str(entry)))
+            except PermissionError:
+                pass
 
             all_results = results + hidden_results
 
@@ -375,7 +425,7 @@ class DiskDiagnoser:
             table.add_column("Path", style="white")
 
             report_lines = []
-            for size, path in all_results[:20]:
+            for size, path in all_results[: CONFIG["MAX_HOME_ITEMS"]]:
                 table.add_row(size, path)
                 report_lines.append(f"{size}\t{path}")
 
@@ -497,7 +547,9 @@ class DiskDiagnoser:
                 self.add_to_report(f"/Library total size: {size}")
 
                 # Use iterative method for subfolders
-                sub_items = self.get_subfolder_sizes(global_lib, limit=10)
+                sub_items = self.get_subfolder_sizes(
+                    global_lib, limit=CONFIG["MAX_SUBFOLDER_ITEMS"]
+                )
 
                 if sub_items:
                     table = Table(title="Top 10 Folders in /Library")
@@ -584,13 +636,17 @@ class DiskDiagnoser:
             task = progress.add_task("Searching for large files...", total=None)
 
             # Use find with maxdepth to avoid hanging on deep structures
-            # Search only top 3 levels of home directory for large files
-            find_cmd = f"find {self.home_dir} -maxdepth 3 -type f -size +100M -mtime -7 2>/dev/null | head -20"
-            output = self.run_command(find_cmd, shell=True, timeout=30)
+            size_arg = f"+{CONFIG['LARGE_FILE_SIZE_MB']}M"
+            find_cmd = f"find {self.home_dir} -maxdepth {CONFIG['FIND_MAX_DEPTH']} -type f -size {size_arg} -mtime -7 2>/dev/null | head -20"
+            output = self.run_command(
+                find_cmd, shell=True, timeout=CONFIG["FIND_FILES_TIMEOUT"]
+            )
 
             if output:
                 files = output.split("\n")
-                table = Table(title="Large Recent Files (Top 3 Levels)")
+                table = Table(
+                    title=f"Large Recent Files (>{CONFIG['LARGE_FILE_SIZE_MB']}MB, Top {CONFIG['FIND_MAX_DEPTH']} Levels)"
+                )
                 table.add_column("Size", style="yellow")
                 table.add_column("Path", style="white")
 
@@ -605,29 +661,142 @@ class DiskDiagnoser:
                 self.add_to_report("\n".join(report_lines))
             else:
                 self.console.print(
-                    "No large recent files found in top levels", style="green"
+                    f"No large recent files found in top {CONFIG['FIND_MAX_DEPTH']} levels",
+                    style="green",
                 )
-                self.add_to_report("No large recent files found in top levels")
+                self.add_to_report(
+                    f"No large recent files found in top {CONFIG['FIND_MAX_DEPTH']} levels"
+                )
 
             progress.update(task, completed=True)
 
+    def get_installed_apps(self) -> Set[str]:
+        """Get a set of lowercase app names found in /Applications"""
+        apps = set()
+        app_dirs = [Path("/Applications"), self.home_dir / "Applications"]
+
+        for dir_path in app_dirs:
+            if dir_path.exists():
+                try:
+                    for item in dir_path.iterdir():
+                        if item.suffix == ".app":
+                            # Store name without .app and lowercased for comparison
+                            apps.add(item.stem.lower())
+                except PermissionError:
+                    continue
+        return apps
+
     def section_orphaned_apps(self):
-        """Section 8: Potential orphaned app data"""
+        """Section 8: Potential orphaned app data (Generic Logic)"""
         self.display_header("Section 8: Potential Orphaned App Data")
 
-        orphaned_apps = [
-            "Spotify",
-            "Slack",
-            "Discord",
-            "Zoom",
-            "Teams",
-            "Skype",
-            "WhatsApp",
-            "Telegram",
-            "Signal",
-        ]
+        # 1. Get list of currently installed apps
+        installed_apps = self.get_installed_apps()
 
-        found_orphans = []
+        # 2. Define system folders to ignore (these are not "orphaned" even if no .app exists)
+        system_folders = {
+            "apple",
+            "icloud",
+            "mobiledocuments",
+            "microsoft",
+            "adobe",
+            "google",
+            "dropbox",
+            "zoom",
+            "slack",
+            "discord",
+            "steam",
+            "com.apple",
+            "com.microsoft",
+            "com.google",
+        }
+
+        support_path = self.home_dir / "Library" / "Application Support"
+        caches_path = self.home_dir / "Library" / "Caches"
+
+        potential_orphans = []
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+            console=self.console,
+        ) as progress:
+            task = progress.add_task("Scanning for leftover app data...", total=None)
+
+            # Helper to check a specific library folder
+            def scan_library_folder(base_path: Path):
+                if not base_path.exists():
+                    return
+
+                try:
+                    entries = [e for e in base_path.iterdir() if e.is_dir()]
+                except PermissionError:
+                    return
+
+                for entry in entries:
+                    name_lower = entry.name.lower()
+
+                    # Skip if it's a known system folder
+                    if any(sys in name_lower for sys in system_folders):
+                        continue
+
+                    # Skip if the app is currently installed
+                    if name_lower in installed_apps:
+                        continue
+
+                    # It's a candidate for orphaned data
+                    size = self.get_folder_size(entry)
+                    if size != "N/A" and size != "0B":
+                        potential_orphans.append((entry.name, str(entry), size))
+
+            scan_library_folder(support_path)
+            scan_library_folder(caches_path)
+
+            progress.update(task, completed=True)
+
+        # Sort by size descending
+        def parse_size(s):
+            s = s.strip()
+            multipliers = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+            match = re.match(r"([\d.]+)([BKMGTP]?)i?", s, re.IGNORECASE)
+            if match:
+                num = float(match.group(1))
+                unit = match.group(2).upper() or "B"
+                return num * multipliers.get(unit, 1)
+            return 0
+
+        potential_orphans.sort(key=lambda x: parse_size(x[2]), reverse=True)
+
+        if potential_orphans:
+            table = Table(title="Leftover/Orphaned App Data")
+            table.add_column("Folder Name", style="cyan")
+            table.add_column("Path", style="white")
+            table.add_column("Size", style="yellow")
+
+            report_lines = []
+            # Show top 15 largest orphans
+            for name, path, size in potential_orphans[:15]:
+                table.add_row(name, path, size)
+                report_lines.append(f"{name}: {path} ({size})")
+
+            self.console.print(table)
+            self.add_to_report("\n".join(report_lines))
+
+            if len(potential_orphans) > 15:
+                self.console.print(
+                    f"... and {len(potential_orphans) - 15} more smaller items.",
+                    style="grey50",
+                )
+        else:
+            self.console.print("No obvious orphaned app data found", style="green")
+            self.add_to_report("No obvious orphaned app data found")
+
+    def section_dev_tools(self):
+        """Section 9: Development tools storage (Generic Detection)"""
+        self.display_header("Section 9: Development Tools Storage")
+
+        dev_tools = []
 
         with Progress(
             SpinnerColumn(),
@@ -636,90 +805,47 @@ class DiskDiagnoser:
             console=self.console,
         ) as progress:
             task = progress.add_task(
-                "Checking for orphaned app data...", total=len(orphaned_apps)
+                "Scanning for dev tools...", total=len(CONFIG["DEV_TOOL_INDICATORS"])
             )
 
-            for app in orphaned_apps:
-                progress.update(task, description=f"Checking {app}...")
+            for indicator in CONFIG["DEV_TOOL_INDICATORS"]:
+                progress.update(task, description=f"Checking {indicator}...")
 
-                paths_to_check = [
-                    self.home_dir / "Library" / "Application Support" / app,
-                    self.home_dir / "Library" / "Caches" / app,
-                    self.home_dir
-                    / "Library"
-                    / "Preferences"
-                    / f"com.{app.lower()}.plist",
-                ]
+                # Handle nested paths like "Library/Caches/pip"
+                if "/" in indicator:
+                    path = self.home_dir / indicator
+                else:
+                    path = self.home_dir / indicator
 
-                for path in paths_to_check:
-                    if path.exists():
-                        size = self.get_folder_size(path)
-                        found_orphans.append((app, str(path), size))
-                        break
+                if path.exists():
+                    size = self.get_folder_size(path)
+                    if size != "N/A" and size != "0B":
+                        dev_tools.append((indicator, size))
 
                 progress.update(task, advance=1)
 
-        if found_orphans:
-            table = Table(title="Orphaned App Data Found")
-            table.add_column("App", style="cyan")
-            table.add_column("Path", style="white")
-            table.add_column("Size", style="yellow")
-
-            report_lines = []
-            for app, path, size in found_orphans:
-                table.add_row(app, path, size)
-                report_lines.append(f"{app}: {path} ({size})")
-
-            self.console.print(table)
-            self.add_to_report("\n".join(report_lines))
-        else:
-            self.console.print("No obvious orphaned app data found", style="green")
-            self.add_to_report("No obvious orphaned app data found")
-
-    def section_dev_tools(self):
-        """Section 9: Development tools storage"""
-        self.display_header("Section 9: Development Tools Storage")
-
-        dev_tools = []
-
-        # Docker
-        docker_path = self.home_dir / "Library" / "Containers" / "com.docker.docker"
-        if docker_path.exists():
-            size = self.get_folder_size(docker_path)
-            dev_tools.append(("Docker", size))
-
-        # npm cache
-        npm_cache = self.home_dir / ".npm"
-        if npm_cache.exists():
-            size = self.get_folder_size(npm_cache)
-            dev_tools.append(("npm cache", size))
-
-        # pip cache
-        pip_cache = self.home_dir / "Library" / "Caches" / "pip"
-        if pip_cache.exists():
-            size = self.get_folder_size(pip_cache)
-            dev_tools.append(("pip cache", size))
-
-        # Homebrew
-        brew_path = Path("/opt/homebrew")
-        if brew_path.exists():
-            size = self.get_folder_size(brew_path)
-            dev_tools.append(("Homebrew", size))
-
-        # Node modules in common locations
-        node_modules_paths = [
-            self.home_dir / "node_modules",
-            self.home_dir / "Documents" / "node_modules",
-        ]
-
-        for nm_path in node_modules_paths:
-            if nm_path.exists():
-                size = self.get_folder_size(nm_path)
-                dev_tools.append((f"node_modules ({nm_path.name})", size))
-
         if dev_tools:
+            # Sort by size
+            def parse_size(s):
+                s = s.strip()
+                multipliers = {
+                    "B": 1,
+                    "K": 1024,
+                    "M": 1024**2,
+                    "G": 1024**3,
+                    "T": 1024**4,
+                }
+                match = re.match(r"([\d.]+)([BKMGTP]?)i?", s, re.IGNORECASE)
+                if match:
+                    num = float(match.group(1))
+                    unit = match.group(2).upper() or "B"
+                    return num * multipliers.get(unit, 1)
+                return 0
+
+            dev_tools.sort(key=lambda x: parse_size(x[1]), reverse=True)
+
             table = Table(title="Development Tools Storage")
-            table.add_column("Tool", style="cyan")
+            table.add_column("Tool/Indicator", style="cyan")
             table.add_column("Size", style="yellow")
 
             report_lines = []
@@ -739,14 +865,14 @@ class DiskDiagnoser:
 
         # Determine severity
         if self.available_gb > 0:
-            if self.available_gb < 10:
+            if self.available_gb < CONFIG["CRITICAL_SPACE_GB"]:
                 severity = "CRITICAL"
                 color = "red bold"
-                message = f"Less than 10GB free space! Immediate action required."
-            elif self.available_gb < 20:
+                message = f"Less than {CONFIG['CRITICAL_SPACE_GB']}GB free space! Immediate action required."
+            elif self.available_gb < CONFIG["WARNING_SPACE_GB"]:
                 severity = "WARNING"
                 color = "yellow"
-                message = f"Less than 20GB free space. Cleanup recommended."
+                message = f"Less than {CONFIG['WARNING_SPACE_GB']}GB free space. Cleanup recommended."
             else:
                 severity = "OK"
                 color = "green"
