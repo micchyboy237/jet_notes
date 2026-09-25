@@ -85,21 +85,28 @@ class DiskDiagnoser:
         logger.info(f"Report saved to: {REPORT_FILE}")
 
     def run_command(
-        self, cmd: list, shell: bool = False, capture: bool = True
+        self, cmd: str | list, shell: bool = False, capture: bool = True
     ) -> Optional[str]:
         """Run shell command and return output"""
         try:
+            # If cmd is a list and contains wildcards, convert to string for shell execution
+            if isinstance(cmd, list):
+                cmd_str = " ".join(cmd)
+                if "*" in cmd_str or "?" in cmd_str:
+                    shell = True
+                    cmd = cmd_str
+
             result = subprocess.run(
                 cmd, shell=shell, capture_output=capture, text=True, timeout=60
             )
             if result.returncode == 0:
                 return result.stdout.strip()
             else:
-                logger.warning(f"Command failed: {' '.join(cmd)}")
+                logger.warning(f"Command failed: {cmd}")
                 logger.warning(f"Error: {result.stderr.strip()}")
                 return None
         except subprocess.TimeoutExpired:
-            logger.warning(f"Command timed out: {' '.join(cmd)}")
+            logger.warning(f"Command timed out: {cmd}")
             return None
         except Exception as e:
             logger.error(f"Command error: {e}")
