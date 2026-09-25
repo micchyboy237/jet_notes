@@ -1,86 +1,62 @@
 #!/bin/bash
-# diagnose-large-disk-usage.sh - Safe, fast disk usage analysis for macOS
+# save as: diagnose-large-disk-usage.sh && chmod +x diagnose-large-disk-usage.sh
 
-set -euo pipefail
-
-echo "=== DISK USAGE DIAGNOSIS ==="
-echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=== 1. Overall Filesystem Status ==="
+df -h /
 echo ""
 
-# 1. Overall filesystem status
-echo "--- FILESYSTEM OVERVIEW ---"
-df -h / | awk 'NR==1 || NR==2 {print}'
+echo "=== 2. APFS Volume Breakdown (Critical for macOS) ==="
+# Shows actual usage per volume including purgeable space
+diskutil apfs list | grep -E "Name:|Capacity|Used|Free|Purgeable|Role:"
 echo ""
 
-# 2. Top-level home directory breakdown (fast, no recursion into deep dirs)
-echo "--- HOME DIRECTORY BREAKDOWN (Top 15) ---"
-du -sh ~/Library/Developer \
-       ~/Library/Caches \
-       ~/Library/Application\ Support \
-       ~/Library/Containers \
-       ~/Library/Logs \
-       ~/.Trash \
-       ~/Downloads \
-       ~/Documents \
-       ~/Desktop \
-       ~/.docker \
-       ~/.orbstack \
-       ~/.npm \
-       ~/.yarn \
-       ~/.pnpm-store \
-       ~/Library/Application\ Support/MobileSync 2>/dev/null | \
-    sort -rh | head -15
+echo "=== 3. Top 15 Largest Directories in Home ==="
+# -d 2 limits depth to avoid overwhelming output
+# sort -hr sorts by size descending
+du -sh ~/* ~/.* 2>/dev/null | sort -hr | head -15
 echo ""
 
-# 3. Xcode-specific deep dive
-echo "--- XCODE STORAGE DETAILS ---"
-echo "DerivedData:"
-du -sh ~/Library/Developer/Xcode/DerivedData 2>/dev/null || echo "  Not found"
-echo "Archives:"
-du -sh ~/Library/Developer/Xcode/Archives 2>/dev/null || echo "  Not found"
-echo "Simulators:"
-xcrun simctl list devices 2>/dev/null | grep -c "Shutdown\|Booted" || echo "  Unable to query"
-du -sh ~/Library/Developer/CoreSimulator 2>/dev/null || echo "  Not found"
+echo "=== 4. Developer-Specific Space Consumers ==="
+declare -A DEV_DIRS=(
+    ["Xcode DerivedData"]="$HOME/Library/Developer/Xcode/DerivedData"
+    ["Xcode Archives"]="$HOME/Library/Developer/Xcode/Archives"
+    ["iOS Simulators"]="$HOME/Library/Developer/CoreSimulator"
+    ["Docker"]="$HOME/Library/Containers/com.docker.docker"
+    ["OrbStack"]="$HOME/.orbstack"
+    ["Homebrew Cache"]="$(brew --cache 2>/dev/null)"
+    ["npm Cache"]="$HOME/.npm"
+    ["yarn Cache"]="$HOME/Library/Caches/Yarn"
+    ["pnpm Store"]="$HOME/Library/pnpm/store"
+    ["iOS Backups"]="$HOME/Library/Application Support/MobileSync/Backup"
+    ["Trash"]="$HOME/.Trash"
+    ["System Caches"]="$HOME/Library/Caches"
+    ["Logs"]="$HOME/Library/Logs"
+)
+
+for name in "${!DEV_DIRS[@]}"; do
+    dir="${DEV_DIRS[$name]}"
+    if [ -d "$dir" ]; then
+        size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+        printf "%-25s %10s  %s\n" "$name:" "$size" "$dir"
+    fi
+done | sort -t' ' -k2 -hr
 echo ""
 
-# 4. Container runtime storage
-echo "--- CONTAINER RUNTIMES ---"
-echo "Docker:"
-docker system df -v 2>/dev/null | tail -1 || echo "  Docker not running or not installed"
-echo "OrbStack:"
-orbctl status 2>/dev/null && du -sh ~/.orbstack 2>/dev/null || echo "  OrbStack not available"
+echo "=== 5. Large Files (>500MB) Modified >30 Days Ago ==="
+find ~ -type f -size +500M -mtime +30 -exec ls -lh {} \; 2>/dev/null | \
+    awk '{print $5, $9}' | sort -hr | head -20
 echo ""
 
-# 5. Node.js package manager caches
-echo "--- NODE.JS CACHES ---"
-echo "npm cache:"
-du -sh ~/.npm/_cacache 2>/dev/null || echo "  Empty/not found"
-echo "yarn cache:"
-du -sh "$(yarn cache dir 2>/dev/null)" 2>/dev/null || echo "  Empty/not found"
-echo "pnpm store:"
-du -sh "$(pnpm store path 2>/dev/null)" 2>/dev/null || echo "  Empty/not found"
+echo "=== 6. Time Machine Local Snapshots ==="
+tmutil listlocalsnapshots / 2>/dev/null || echo "No local snapshots found"
 echo ""
 
-# 6. Time Machine local snapshots
-echo "--- TIME MACHINE LOCAL SNAPSHOTS ---"
-tmutil listlocalsnapshots / 2>/dev/null || echo "  No local snapshots or TM disabled"
+echo "=== 7. Docker/Container Disk Usage ==="
+docker system df -v 2>/dev/null | head -30 || echo "Docker not running or not installed"
 echo ""
 
-# 7. Large individual files (>500MB) in user-writable areas
-echo "--- LARGE FILES (>500MB) IN HOME ---"
-find ~ -xdev -type f -size +500M \
-    -not -path "*/Library/Mail/*" \
-    -not -path "*/.Trash/*" \
-    -not -path "*/node_modules/*" \
-    -not -path "*/.git/*" \
-    -exec ls -lh {} \; 2>/dev/null | \
-    awk '{print $5, $9}' | sort -rh | head -20
-echo ""
-
-# 8. Purgeable space (APFS-specific)
-echo "--- APFS PURGEABLE SPACE ---"
-diskutil apfs list 2>/dev/null | grep -A2 "Purgeable" || echo "  Unable to query APFS info"
-echo ""
-
-echo "=== DIAGNOSIS COMPLETE ==="
-echo "Review output above BEFORE running any cleanup commands."
+echo "=== 8. Old Python Virtual Environments (Common Hidden Consumer) ==="
+find ~ -maxdepth 4 -type d -name ".venv" -o -name "venv" -o -name ".env" 2>/dev/null | while read venv; do
+    size=$(du -sh "$venv" 2>/dev/null | cut -f1)
+    echo "$size  $venv"
+done | sort -hr | head -10
