@@ -12,13 +12,12 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 # Rich library for beautiful terminal output
 try:
     from rich.console import Console
     from rich.logging import RichHandler
-    from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.progress import (
         BarColumn,
@@ -73,6 +72,7 @@ class DiskDiagnoser:
         self.console = console
         self.report_lines = []
         self.home_dir = Path.home()
+        self.available_gb = 0
 
     def add_to_report(self, text: str):
         """Add line to report file"""
@@ -85,49 +85,100 @@ class DiskDiagnoser:
         logger.info(f"Report saved to: {REPORT_FILE}")
 
     def run_command(
-        self, cmd: str | list, shell: bool = False, capture: bool = True
+        self,
+        cmd: list | str,
+        shell: bool = False,
+        capture: bool = True,
+        timeout: int = 30,
     ) -> Optional[str]:
         """Run shell command and return output"""
         try:
-            # If cmd is a list and contains wildcards, convert to string for shell execution
-            if isinstance(cmd, list):
-                cmd_str = " ".join(cmd)
-                if "*" in cmd_str or "?" in cmd_str:
-                    shell = True
-                    cmd = cmd_str
+            # Handle wildcard expansion manually if not using shell
+            if isinstance(cmd, list) and not shell:
+                has_wildcard = any("*" in str(c) for c in cmd)
+                if has_wildcard:
+                    # Convert to string and enable shell for this specific call
+                    cmd_str = " ".join(str(c) for c in cmd)
+                    result = subprocess.run(
+                        cmd_str,
+                        shell=True,
+                        capture_output=capture,
+                        text=True,
+                        timeout=timeout,
+                    )
+                else:
+                    result = subprocess.run(
+                        cmd,
+                        shell=shell,
+                        capture_output=capture,
+                        text=True,
+                        timeout=timeout,
+                    )
+            else:
+                result = subprocess.run(
+                    cmd, shell=shell, capture_output=capture, text=True, timeout=timeout
+                )
 
-            result = subprocess.run(
-                cmd, shell=shell, capture_output=capture, text=True, timeout=60
-            )
             if result.returncode == 0:
                 return result.stdout.strip()
             else:
-                logger.warning(f"Command failed: {cmd}")
-                logger.warning(f"Error: {result.stderr.strip()}")
+                # Only warn if it's not a "no such file" due to empty glob
+                if "No such file or directory" not in result.stderr:
+                    logger.warning(f"Command failed: {cmd}")
+                    logger.warning(f"Error: {result.stderr.strip()}")
                 return None
         except subprocess.TimeoutExpired:
-            logger.warning(f"Command timed out: {cmd}")
+            logger.warning(f"Command timed out after {timeout}s: {cmd}")
             return None
         except Exception as e:
             logger.error(f"Command error: {e}")
             return None
 
     def get_folder_size(self, path: Path) -> str:
-        """Get human-readable folder size with fallback"""
+        """Get human-readable folder size"""
+        if not path.exists():
+            return "0B"
         try:
-            result = subprocess.run(
-                ["du", "-sh", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=30,  # Reduced from 60s
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.split()[0]
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Timed out measuring {path} (skipping)")
-        except Exception:
-            pass
-        return "N/A"
+            # Use maxdepth 1 to avoid hanging on deep nested structures during quick scan
+            # Actually, du -sh is recursive by default. Let's stick to it but with timeout.
+            result = self.run_command(["du", "-sh", str(path)], timeout=20)
+            if result:
+                return result.split()[0]
+            return "N/A"
+        except:
+            return "N/A"
+
+    def get_subfolder_sizes(
+        self, parent_path: Path, limit: int = 10
+    ) -> List[Tuple[str, str]]:
+        """Safely get sizes of immediate subfolders using iteration instead of wildcards"""
+        results = []
+        if not parent_path.is_dir():
+            return results
+
+        try:
+            entries = [e for e in parent_path.iterdir() if e.is_dir()]
+        except PermissionError:
+            return results
+
+        for entry in entries:
+            size = self.get_folder_size(entry)
+            if size != "N/A":
+                results.append((size, str(entry)))
+
+        # Sort by size
+        def parse_size(s):
+            s = s.strip()
+            multipliers = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+            match = re.match(r"([\d.]+)([BKMGTP]?)i?", s, re.IGNORECASE)
+            if match:
+                num = float(match.group(1))
+                unit = match.group(2).upper() or "B"
+                return num * multipliers.get(unit, 1)
+            return 0
+
+        results.sort(key=lambda x: parse_size(x[0]), reverse=True)
+        return results[:limit]
 
     def display_header(self, title: str):
         """Display section header"""
@@ -152,7 +203,6 @@ class DiskDiagnoser:
         ) as progress:
             task = progress.add_task("Analyzing disk usage...", total=None)
 
-            # Get disk info
             df_output = self.run_command(["df", "-h", "/"])
 
             if df_output:
@@ -182,7 +232,12 @@ class DiskDiagnoser:
                         )
 
                         # Store available space for recommendations
-                        self.available_gb = float(re.sub(r"[A-Za-z]", "", available))
+                        try:
+                            self.available_gb = float(
+                                re.sub(r"[A-Za-z]", "", available)
+                            )
+                        except:
+                            self.available_gb = 0
 
             progress.update(task, completed=True)
 
@@ -198,35 +253,32 @@ class DiskDiagnoser:
         ) as progress:
             task = progress.add_task("Scanning root directories...", total=None)
 
-            # Use non-recursive du (-s only, no -h recursion into subdirs)
-            # Skip /System (read-only, always ~12GB+) and /Volumes (mount points)
-            skip_dirs = {"/System", "/Volumes", "/Library/Apple"}
+            # Iterate root items instead of using wildcard du
             root_items = []
-
             try:
-                entries = os.listdir("/")
+                for entry in os.listdir("/"):
+                    full_path = Path("/") / entry
+                    if full_path.is_dir() and entry not in [
+                        "System",
+                        "Volumes",
+                        "dev",
+                        "proc",
+                    ]:
+                        root_items.append(full_path)
             except PermissionError:
-                entries = []
+                pass
 
-            for entry in entries:
-                full_path = Path("/") / entry
-                if str(full_path) in skip_dirs or not full_path.is_dir():
-                    continue
-                root_items.append(str(full_path))
-
-            # Run du without sudo first (most dirs are readable)
-            # Only use sudo if needed, and with a short timeout per item
             results = []
             for item in root_items:
-                progress.update(task, description=f"Measuring {item}...")
-                size = self.get_folder_size(Path(item))  # Uses du -sh with 60s timeout
+                progress.update(task, description=f"Measuring /{item.name}...")
+                size = self.get_folder_size(item)
                 if size != "N/A":
-                    results.append((size, item))
+                    results.append((size, str(item)))
 
-            # Add known-size skipped dirs as notes
-            results.append(("~12G+", "/System (read-only, skipped)"))
+            # Add skipped system dir note
+            results.append(("~12G+", "/System (Skipped)"))
 
-            # Sort by size descending
+            # Sort
             def parse_size(s):
                 s = s.strip()
                 multipliers = {
@@ -271,31 +323,48 @@ class DiskDiagnoser:
         ) as progress:
             task = progress.add_task("Analyzing home directory...", total=None)
 
-            output = self.run_command(
-                ["du", "-sh", str(self.home_dir) + "/*", str(self.home_dir) + "/.*"]
-            )
+            # Use iterative approach instead of wildcard du
+            results = self.get_subfolder_sizes(self.home_dir, limit=20)
 
-            if output:
-                lines = output.split("\n")
-                sorted_lines = sorted(
-                    [line for line in lines if line],
-                    key=lambda x: float(re.sub(r"[A-Za-z]", "", x.split()[0]))
-                    if x.split()[0].replace(".", "").isdigit()
-                    else 0,
-                    reverse=True,
-                )[:20]
+            # Also check hidden files/folders
+            hidden_results = []
+            for entry in self.home_dir.iterdir():
+                if entry.name.startswith(".") and entry.is_dir():
+                    size = self.get_folder_size(entry)
+                    if size != "N/A":
+                        hidden_results.append((size, str(entry)))
 
-                table = Table(title="Top 20 Items in Home Directory")
-                table.add_column("Size", style="yellow")
-                table.add_column("Path", style="white")
+            all_results = results + hidden_results
 
-                for line in sorted_lines:
-                    parts = line.split(None, 1)
-                    if len(parts) == 2:
-                        table.add_row(parts[0], parts[1])
+            def parse_size(s):
+                s = s.strip()
+                multipliers = {
+                    "B": 1,
+                    "K": 1024,
+                    "M": 1024**2,
+                    "G": 1024**3,
+                    "T": 1024**4,
+                }
+                match = re.match(r"([\d.]+)([BKMGTP]?)i?", s, re.IGNORECASE)
+                if match:
+                    num = float(match.group(1))
+                    unit = match.group(2).upper() or "B"
+                    return num * multipliers.get(unit, 1)
+                return 0
 
-                self.console.print(table)
-                self.add_to_report("\n".join(sorted_lines))
+            all_results.sort(key=lambda x: parse_size(x[0]), reverse=True)
+
+            table = Table(title="Top Items in Home Directory")
+            table.add_column("Size", style="yellow")
+            table.add_column("Path", style="white")
+
+            report_lines = []
+            for size, path in all_results[:20]:
+                table.add_row(size, path)
+                report_lines.append(f"{size}\t{path}")
+
+            self.console.print(table)
+            self.add_to_report("\n".join(report_lines))
 
             progress.update(task, completed=True)
 
@@ -308,7 +377,6 @@ class DiskDiagnoser:
             logger.warning("~/Library not found")
             return
 
-        # Main library folders
         critical_folders = [
             ("Caches", library_path / "Caches"),
             ("Application Support", library_path / "Application Support"),
@@ -339,9 +407,21 @@ class DiskDiagnoser:
                     size = self.get_folder_size(folder_path)
 
                     # Color code based on size
-                    size_num = (
-                        float(re.sub(r"[A-Za-z]", "", size)) if size != "N/A" else 0
-                    )
+                    size_num = 0
+                    if size != "N/A":
+                        match = re.match(r"([\d.]+)([BKMGTP]?)i?", size, re.IGNORECASE)
+                        if match:
+                            multipliers = {
+                                "B": 1,
+                                "K": 1024,
+                                "M": 1024**2,
+                                "G": 1024**3,
+                                "T": 1024**4,
+                            }
+                            num = float(match.group(1))
+                            unit = match.group(2).upper() or "B"
+                            size_num = num * multipliers.get(unit, 1) / (1024**3)  # GB
+
                     if size_num > 10:
                         size_text = Text(f"{size}", style="red bold")
                     elif size_num > 5:
@@ -352,35 +432,21 @@ class DiskDiagnoser:
                     self.console.print(f"  {folder_name:25s}: {size_text}")
                     self.add_to_report(f"{folder_name}: {size}")
 
-                    # Show top items for large folders
+                    # Show top items for large folders using iterative method
                     if size_num > 1 and folder_name in [
                         "Caches",
                         "Application Support",
                         "Containers",
                     ]:
-                        sub_output = self.run_command(
-                            ["du", "-sh", str(folder_path) + "/*"]
-                        )
-                        if sub_output:
-                            sub_lines = sub_output.split("\n")
-                            sorted_subs = sorted(
-                                [line for line in sub_lines if line],
-                                key=lambda x: float(
-                                    re.sub(r"[A-Za-z]", "", x.split()[0])
-                                )
-                                if x.split()[0].replace(".", "").isdigit()
-                                else 0,
-                                reverse=True,
-                            )[:10]
-
-                            if sorted_subs:
-                                self.console.print(f"    Top items in {folder_name}:")
-                                for sub_line in sorted_subs[:5]:
-                                    self.console.print(f"      {sub_line}")
-                                self.add_to_report(
-                                    f"  Top items in {folder_name}:\n"
-                                    + "\n".join(sorted_subs[:5])
-                                )
+                        sub_items = self.get_subfolder_sizes(folder_path, limit=5)
+                        if sub_items:
+                            self.console.print(f"    Top items in {folder_name}:")
+                            for s, p in sub_items:
+                                self.console.print(f"      {s} - {Path(p).name}")
+                            self.add_to_report(
+                                f"  Top items in {folder_name}:\n"
+                                + "\n".join([f"{s} - {p}" for s, p in sub_items])
+                            )
 
                 progress.update(task, advance=1)
 
@@ -414,28 +480,21 @@ class DiskDiagnoser:
                 self.console.print(f"/Library total size: {size}", style="cyan")
                 self.add_to_report(f"/Library total size: {size}")
 
-                output = self.run_command(["sudo", "du", "-sh", "/Library/*"])
-                if output:
-                    lines = output.split("\n")
-                    sorted_lines = sorted(
-                        [line for line in lines if line],
-                        key=lambda x: float(re.sub(r"[A-Za-z]", "", x.split()[0]))
-                        if x.split()[0].replace(".", "").isdigit()
-                        else 0,
-                        reverse=True,
-                    )[:10]
+                # Use iterative method for subfolders
+                sub_items = self.get_subfolder_sizes(global_lib, limit=10)
 
+                if sub_items:
                     table = Table(title="Top 10 Folders in /Library")
                     table.add_column("Size", style="yellow")
                     table.add_column("Path", style="white")
 
-                    for line in sorted_lines:
-                        parts = line.split(None, 1)
-                        if len(parts) == 2:
-                            table.add_row(parts[0], parts[1])
+                    report_lines = []
+                    for s, p in sub_items:
+                        table.add_row(s, p)
+                        report_lines.append(f"{s}\t{p}")
 
                     self.console.print(table)
-                    self.add_to_report("\n".join(sorted_lines))
+                    self.add_to_report("\n".join(report_lines))
 
                 progress.update(task, completed=True)
 
@@ -491,7 +550,7 @@ class DiskDiagnoser:
                     self.console.print("No local snapshots found", style="green")
                     self.add_to_report("No local snapshots found")
             else:
-                self.console.print(f"Filesystem: Not APFS", style="gray")
+                self.console.print(f"Filesystem: Not APFS", style="grey50")
                 self.add_to_report("Filesystem: Not APFS")
 
             progress.update(task, completed=True)
@@ -508,26 +567,31 @@ class DiskDiagnoser:
         ) as progress:
             task = progress.add_task("Searching for large files...", total=None)
 
-            # Find files >100MB modified in last 7 days
-            find_cmd = f"find {self.home_dir} -type f -size +100M -mtime -7 2>/dev/null | head -20"
-            output = self.run_command(find_cmd, shell=True)
+            # Use find with maxdepth to avoid hanging on deep structures
+            # Search only top 3 levels of home directory for large files
+            find_cmd = f"find {self.home_dir} -maxdepth 3 -type f -size +100M -mtime -7 2>/dev/null | head -20"
+            output = self.run_command(find_cmd, shell=True, timeout=30)
 
             if output:
                 files = output.split("\n")
-                table = Table(title="Large Recent Files")
+                table = Table(title="Large Recent Files (Top 3 Levels)")
                 table.add_column("Size", style="yellow")
                 table.add_column("Path", style="white")
 
+                report_lines = []
                 for file_path in files[:15]:
                     if file_path:
                         size = self.get_folder_size(Path(file_path))
                         table.add_row(size, file_path)
-                        self.add_to_report(f"{size} - {file_path}")
+                        report_lines.append(f"{size} - {file_path}")
 
                 self.console.print(table)
+                self.add_to_report("\n".join(report_lines))
             else:
-                self.console.print("No large recent files found", style="green")
-                self.add_to_report("No large recent files found")
+                self.console.print(
+                    "No large recent files found in top levels", style="green"
+                )
+                self.add_to_report("No large recent files found in top levels")
 
             progress.update(task, completed=True)
 
@@ -585,11 +649,13 @@ class DiskDiagnoser:
             table.add_column("Path", style="white")
             table.add_column("Size", style="yellow")
 
+            report_lines = []
             for app, path, size in found_orphans:
                 table.add_row(app, path, size)
-                self.add_to_report(f"{app}: {path} ({size})")
+                report_lines.append(f"{app}: {path} ({size})")
 
             self.console.print(table)
+            self.add_to_report("\n".join(report_lines))
         else:
             self.console.print("No obvious orphaned app data found", style="green")
             self.add_to_report("No obvious orphaned app data found")
@@ -640,13 +706,15 @@ class DiskDiagnoser:
             table.add_column("Tool", style="cyan")
             table.add_column("Size", style="yellow")
 
+            report_lines = []
             for tool, size in dev_tools:
                 table.add_row(tool, size)
-                self.add_to_report(f"{tool}: {size}")
+                report_lines.append(f"{tool}: {size}")
 
             self.console.print(table)
+            self.add_to_report("\n".join(report_lines))
         else:
-            self.console.print("No development tools detected", style="gray")
+            self.console.print("No development tools detected", style="grey50")
             self.add_to_report("No development tools detected")
 
     def section_recommendations(self):
@@ -654,7 +722,7 @@ class DiskDiagnoser:
         self.display_header("Section 10: Diagnosis Summary & Recommendations")
 
         # Determine severity
-        if hasattr(self, "available_gb"):
+        if self.available_gb > 0:
             if self.available_gb < 10:
                 severity = "CRITICAL"
                 color = "red bold"
@@ -693,11 +761,15 @@ class DiskDiagnoser:
         table.add_column("Action", style="cyan")
         table.add_column("Command", style="white")
 
+        report_lines = []
         for action, cmd in cleanup_commands:
             table.add_row(action, cmd)
-            self.add_to_report(f"{action}: {cmd}")
+            report_lines.append(f"{action}: {cmd}")
 
         self.console.print(table)
+        self.add_to_report(
+            "\nRecommended Cleanup Commands:\n" + "\n".join(report_lines)
+        )
 
         self.console.print("\n⚠️  Always verify before deleting!", style="yellow bold")
         self.add_to_report("\n⚠️ Always verify before deleting!")
@@ -707,7 +779,7 @@ class DiskDiagnoser:
         self.console.print(
             Panel(
                 "[bold cyan]Mac M1 Disk Space Diagnosis Tool[/bold cyan]\n"
-                f"[gray]Starting comprehensive analysis at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/gray]",
+                f"[grey50]Starting comprehensive analysis at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/grey50]",
                 border_style="cyan",
                 padding=(1, 2),
             )
