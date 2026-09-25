@@ -113,14 +113,21 @@ class DiskDiagnoser:
             return None
 
     def get_folder_size(self, path: Path) -> str:
-        """Get human-readable folder size"""
+        """Get human-readable folder size with fallback"""
         try:
-            result = self.run_command(["du", "-sh", str(path)])
-            if result:
-                return result.split()[0]
-            return "N/A"
-        except:
-            return "N/A"
+            result = subprocess.run(
+                ["du", "-sh", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,  # Reduced from 60s
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.split()[0]
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timed out measuring {path} (skipping)")
+        except Exception:
+            pass
+        return "N/A"
 
     def display_header(self, title: str):
         """Display section header"""
@@ -191,30 +198,64 @@ class DiskDiagnoser:
         ) as progress:
             task = progress.add_task("Scanning root directories...", total=None)
 
-            output = self.run_command(["sudo", "du", "-sh", "/*"], capture=True)
+            # Use non-recursive du (-s only, no -h recursion into subdirs)
+            # Skip /System (read-only, always ~12GB+) and /Volumes (mount points)
+            skip_dirs = {"/System", "/Volumes", "/Library/Apple"}
+            root_items = []
 
-            if output:
-                lines = output.split("\n")
-                # Sort by size
-                sorted_lines = sorted(
-                    [line for line in lines if line],
-                    key=lambda x: float(re.sub(r"[A-Za-z]", "", x.split()[0]))
-                    if x.split()[0].replace(".", "").isdigit()
-                    else 0,
-                    reverse=True,
-                )[:15]
+            try:
+                entries = os.listdir("/")
+            except PermissionError:
+                entries = []
 
-                table = Table(title="Top 15 Root Directories")
-                table.add_column("Size", style="yellow")
-                table.add_column("Path", style="white")
+            for entry in entries:
+                full_path = Path("/") / entry
+                if str(full_path) in skip_dirs or not full_path.is_dir():
+                    continue
+                root_items.append(str(full_path))
 
-                for line in sorted_lines:
-                    parts = line.split(None, 1)
-                    if len(parts) == 2:
-                        table.add_row(parts[0], parts[1])
+            # Run du without sudo first (most dirs are readable)
+            # Only use sudo if needed, and with a short timeout per item
+            results = []
+            for item in root_items:
+                progress.update(task, description=f"Measuring {item}...")
+                size = self.get_folder_size(Path(item))  # Uses du -sh with 60s timeout
+                if size != "N/A":
+                    results.append((size, item))
 
-                self.console.print(table)
-                self.add_to_report("\n".join(sorted_lines))
+            # Add known-size skipped dirs as notes
+            results.append(("~12G+", "/System (read-only, skipped)"))
+
+            # Sort by size descending
+            def parse_size(s):
+                s = s.strip()
+                multipliers = {
+                    "B": 1,
+                    "K": 1024,
+                    "M": 1024**2,
+                    "G": 1024**3,
+                    "T": 1024**4,
+                }
+                match = re.match(r"([\d.]+)([BKMGTP]?)i?", s, re.IGNORECASE)
+                if match:
+                    num = float(match.group(1))
+                    unit = match.group(2).upper() or "B"
+                    return num * multipliers.get(unit, 1)
+                return 0
+
+            results.sort(key=lambda x: parse_size(x[0]), reverse=True)
+
+            table = Table(title="Top Root Directories")
+            table.add_column("Size", style="yellow")
+            table.add_column("Path", style="white")
+
+            report_lines = []
+            for size, path in results[:15]:
+                table.add_row(size, path)
+                report_lines.append(f"{size}\t{path}")
+
+            self.console.print(table)
+            self.add_to_report("\n".join(report_lines))
 
             progress.update(task, completed=True)
 
