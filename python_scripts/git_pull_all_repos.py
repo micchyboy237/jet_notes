@@ -11,6 +11,7 @@ Features:
   • Sort by .git size to prioritize small/large repos.
   • SAFE RECLONE: Removes and reclones repos when safe (no local changes),
     providing faster updates and automatic history cleanup.
+  • SMART CHECK: Only reclones when there are actual updates to fetch.
 Usage examples:
   # Pull all repos (shallow since 1 year ago, with reclone optimization)
   python git_pull_all_repos.py /path/to/repos
@@ -208,6 +209,83 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _check_if_updates_available(
+    repo_path: Path,
+    branch: str,
+    fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
+) -> tuple[bool, str]:
+    """Check if there are actually updates to fetch from remote.
+
+    Returns:
+        Tuple of (has_updates, message)
+        - If updates available: (True, "description")
+        - If up-to-date: (False, "Already up to date")
+    """
+    try:
+        # Fetch remote refs without merging (fast operation)
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "fetch", "--dry-run"],
+            capture_output=True,
+            text=True,
+            timeout=fetch_timeout,
+            check=True,
+        )
+
+        # Check if there are any new commits
+        if result.stderr or result.stdout:
+            # Look for indicators of new commits
+            combined_output = (result.stdout + result.stderr).lower()
+            if any(
+                indicator in combined_output
+                for indicator in [
+                    "new tag",
+                    "new branch",
+                    "from",
+                    "to",
+                    "updating",
+                    "remote:",
+                    "counting objects",
+                    "compressing objects",
+                ]
+            ):
+                return True, "Updates available from remote"
+
+        # Double-check by comparing local vs remote commit hashes
+        try:
+            local_hash = subprocess.run(
+                ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+
+            remote_hash = subprocess.run(
+                ["git", "-C", str(repo_path), "rev-parse", f"origin/{branch}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            ).stdout.strip()
+
+            if local_hash != remote_hash:
+                return (
+                    True,
+                    f"Local ({local_hash[:8]}) differs from remote ({remote_hash[:8]})",
+                )
+            else:
+                return False, "Already up to date"
+        except Exception:
+            # If we can't compare hashes, assume updates might be available
+            return True, "Cannot verify, assuming updates available"
+
+    except subprocess.TimeoutExpired:
+        return True, "Fetch timed out, will attempt reclone"
+    except Exception as e:
+        # If check fails, assume updates might be available
+        return True, f"Update check failed: {e}, will attempt reclone"
+
+
 def _check_shallow_boundary(
     repo_path: Path, branch: str, shallow_since: str | None
 ) -> dict:
@@ -380,8 +458,10 @@ def run_git_pull(
 
     Strategy:
     1. Check if repo is safe to reclone (no local changes)
-    2. If safe and use_reclone=True: remove and reclone (faster, cleaner)
-    3. If not safe or use_reclone=False: traditional fetch + merge
+    2. If safe and use_reclone=True: check if updates exist
+    3. If updates exist: remove and reclone (faster, cleaner)
+    4. If no updates: mark as up-to-date (skip reclone)
+    5. If not safe or use_reclone=False: traditional fetch + merge
 
     Includes pre-flight stale lock cleanup to prevent 'shallow.lock' errors.
     Always enforces shallow_since when specified.
@@ -396,7 +476,59 @@ def run_git_pull(
 
         if is_safe:
             console.print(f"  [green]✓ Safe to reclone[/green]")
-            return _reclone_repo(repo_path, shallow_since, fetch_timeout)
+
+            # Get current branch for update check
+            branch = None
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=True,
+                )
+                branch = result.stdout.strip()
+                if branch == "HEAD":
+                    branch = None
+            except Exception:
+                pass
+
+            if not branch:
+                try:
+                    result = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo_path),
+                            "symbolic-ref",
+                            "--short",
+                            "refs/remotes/origin/HEAD",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=True,
+                    )
+                    branch = result.stdout.strip().replace("origin/", "")
+                except Exception:
+                    branch = "HEAD"
+
+            # Check if there are actually updates to fetch
+            console.print(f"  [dim]Checking for updates on branch '{branch}'...[/dim]")
+            has_updates, update_message = _check_if_updates_available(
+                repo_path, branch, fetch_timeout
+            )
+
+            if not has_updates:
+                console.print(f"  [blue]→ {update_message}[/blue]")
+                shallow_status = _check_shallow_boundary(
+                    repo_path, branch, shallow_since
+                )
+                return "up-to-date", update_message, shallow_status
+            else:
+                console.print(f"  [green]✓ {update_message}[/green]")
+                console.print(f"  [cyan]Proceeding with reclone...[/cyan]")
+                return _reclone_repo(repo_path, shallow_since, fetch_timeout)
         else:
             console.print(f"  [yellow]⚠ Cannot reclone: {safety_reason}[/yellow]")
             console.print(f"  [dim]Falling back to traditional fetch/merge[/dim]")
@@ -676,6 +808,7 @@ def git_pull_all_repos(
     Verifies shallow boundary and records unfetched commit status in state.
     Merge conflicts are caught and recorded as 'error' status.
     Uses reclone optimization when safe (no local changes).
+    Smart check: only reclones when updates are actually available.
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
@@ -689,7 +822,7 @@ def git_pull_all_repos(
         else "[bold yellow]Full history mode (no shallow-since)[/bold yellow]"
     )
     reclone_line = (
-        "[bold green]Reclone optimization: ENABLED[/bold green]"
+        "[bold green]Reclone optimization: ENABLED (with smart update check)[/bold green]"
         if use_reclone and shallow_since
         else "[dim]Reclone optimization: disabled[/dim]"
     )
