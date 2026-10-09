@@ -3,14 +3,9 @@ git_pull_all_repos.py – Pull all Git repositories under a directory.
 Features:
   • Resumable: state is saved after every repo; use --continue after Ctrl+C.
   • Retry failed: use --only-failed to retry only previously failed repos.
-  • Time-based shallow fetch (--shallow-since) or full history.
-  • Pre-flight stale lock cleanup prevents 'shallow.lock' errors.
-  • Shallow boundary verification: detects if remote has commits outside
-    the shallow-since window that were not fetched.
-  • Merge conflicts are caught and recorded as "error" state.
-  • Sort by .git size to prioritize small/large repos.
-  • SAFE RECLONE: Removes and reclones repos when safe (no local changes),
-    providing faster updates and automatic history cleanup.
+  • Time-based shallow clone (--shallow-since) or full history.
+  • STRICT RECLONE: Removes and reclones repos if safe (no uncommitted/stashed work).
+    Ignores local branches, unpushed commits, or detached HEADs.
   • SMART CHECK: Only reclones when there are actual updates to fetch.
 Usage examples:
   # Pull all repos (shallow since 1 year ago, with reclone optimization)
@@ -65,73 +60,17 @@ def _safe_strip(text: str | bytes | None) -> str:
     return str(text).strip()
 
 
-def _cleanup_stale_locks(repo_path: Path) -> bool:
-    """Remove stale git lock files before operations begin.
-    Returns True if any locks were removed, False otherwise.
-    This prevents 'Unable to create *.lock' errors from
-    previously interrupted processes.
-
-    Checks for:
-    - Standard locks: shallow.lock, index.lock, HEAD.lock
-    - Ref locks: Any *.lock files under .git/refs/ (e.g., branch lock conflicts)
-    """
-    cleaned = False
-
-    # Check standard lock files
-    standard_locks = [
-        repo_path / ".git" / "shallow.lock",
-        repo_path / ".git" / "index.lock",
-        repo_path / ".git" / "HEAD.lock",
-    ]
-
-    for lock_path in standard_locks:
-        if lock_path.exists():
-            try:
-                lock_path.unlink(missing_ok=True)
-                console.print(
-                    f"  [yellow]⚠ Removed stale lock:[/yellow] {lock_path.name}"
-                )
-                cleaned = True
-            except OSError as e:
-                console.print(
-                    f"  [red]✗ Failed to remove lock {lock_path.name}: {e}[/red]"
-                )
-
-    # Check for stale ref locks anywhere under .git/refs/
-    # These can occur when git fetch/update-ref is interrupted
-    refs_dir = repo_path / ".git" / "refs"
-    if refs_dir.exists():
-        try:
-            # Find all .lock files recursively under refs/
-            lock_files = list(refs_dir.rglob("*.lock"))
-            for lock_path in lock_files:
-                try:
-                    lock_path.unlink(missing_ok=True)
-                    # Show relative path for clarity
-                    rel_path = lock_path.relative_to(repo_path / ".git")
-                    console.print(
-                        f"  [yellow]⚠ Removed stale ref lock:[/yellow] {rel_path}"
-                    )
-                    cleaned = True
-                except OSError as e:
-                    console.print(
-                        f"  [red]✗ Failed to remove ref lock {lock_path.name}: {e}[/red]"
-                    )
-        except Exception as e:
-            console.print(f"  [yellow]⚠ Could not scan for ref locks: {e}[/yellow]")
-
-    return cleaned
-
-
 def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
-    """Check if repository is safe to reclone (no local changes).
+    """Check if repository is safe to reclone.
+
+    In STRICT mode, we only block if there is UNSAVED WORK that would be lost.
+    We IGNORE local branches, unpushed commits, or detached HEADs because
+    the reclone will intentionally overwrite them with the remote state.
 
     Returns:
         Tuple of (is_safe, reason_if_unsafe)
-        - If safe: (True, "")
-        - If unsafe: (False, "description of what would be lost")
     """
-    # Check 1: Uncommitted changes in working directory
+    # Check 1: Uncommitted changes in working directory (CRITICAL)
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "status", "--porcelain"],
@@ -145,7 +84,7 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to check status: {e}"
 
-    # Check 2: Staged changes (already covered by status --porcelain, but explicit check)
+    # Check 2: Staged changes (CRITICAL)
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "diff", "--cached", "--name-only"],
@@ -159,7 +98,7 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to check staged changes: {e}"
 
-    # Check 3: Stashed changes
+    # Check 3: Stashed changes (CRITICAL - often forgotten work)
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "stash", "list"],
@@ -174,69 +113,9 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to check stashes: {e}"
 
-    # Check 4: Local branches not on remote
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "branch", "-v"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-        branches = result.stdout.strip().split("\n")
-        for branch_line in branches:
-            if "[gone]" in branch_line.lower():
-                return False, "Has local branch(es) that diverged from remote"
-            # Check for branches without upstream
-            if "*" not in branch_line and "->" not in branch_line:
-                branch_name = branch_line.strip().lstrip("*").strip()
-                if branch_name and branch_name not in ("master", "main"):
-                    # Has local-only branch
-                    return False, f"Has local branch '{branch_name}' not on remote"
-    except Exception:
-        pass  # Don't fail on this check
-
-    # Check 5: Detached HEAD with unpushed commits
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-        current_ref = result.stdout.strip()
-        if current_ref == "HEAD":
-            # Detached HEAD - check if there are commits not on any branch
-            result = subprocess.run(
-                ["git", "-C", str(repo_path), "log", "--oneline", "--decorate", "-1"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=True,
-            )
-            if "HEAD" in result.stdout and "->" not in result.stdout:
-                return False, "Detached HEAD state - may have unpushed commits"
-    except Exception:
-        pass
-
-    # Check 6: Unpushed commits on current branch
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-list", "--count", "HEAD..@{upstream}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,  # May fail if no upstream
-        )
-        if result.returncode == 0:
-            ahead_count = int(result.stdout.strip())
-            if ahead_count > 0:
-                return False, f"Has {ahead_count} unpushed commit(s) on current branch"
-    except Exception:
-        pass  # No upstream configured, skip this check
-
     # All checks passed - safe to reclone
+    # Note: We intentionally DO NOT check for local branches or unpushed commits
+    # because the user wants a strict sync with remote.
     return True, ""
 
 
@@ -245,13 +124,7 @@ def _check_if_updates_available(
     branch: str,
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[bool, str]:
-    """Check if there are actually updates to fetch from remote.
-
-    Returns:
-        Tuple of (has_updates, message)
-        - If updates available: (True, "description")
-        - If up-to-date: (False, "Already up to date")
-    """
+    """Check if there are actually updates to fetch from remote."""
     try:
         # Fetch remote refs without merging (fast operation)
         result = subprocess.run(
@@ -264,7 +137,6 @@ def _check_if_updates_available(
 
         # Check if there are any new commits
         if result.stderr or result.stdout:
-            # Look for indicators of new commits
             combined_output = (result.stdout + result.stderr).lower()
             if any(
                 indicator in combined_output
@@ -307,23 +179,18 @@ def _check_if_updates_available(
             else:
                 return False, "Already up to date"
         except Exception:
-            # If we can't compare hashes, assume updates might be available
             return True, "Cannot verify, assuming updates available"
 
     except subprocess.TimeoutExpired:
         return True, "Fetch timed out, will attempt reclone"
     except Exception as e:
-        # If check fails, assume updates might be available
         return True, f"Update check failed: {e}, will attempt reclone"
 
 
 def _check_shallow_boundary(
     repo_path: Path, branch: str, shallow_since: str | None
 ) -> dict:
-    """Compare local and remote tip dates to verify shallow completeness.
-    Returns a dict with shallow status information.
-    Only meaningful when shallow_since is set.
-    """
+    """Compare local and remote tip dates to verify shallow completeness."""
     status: dict = {
         "mode": "shallow-since" if shallow_since else "full",
         "value": shallow_since,
@@ -378,15 +245,7 @@ def _reclone_repo(
     shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[Literal["success", "failed", "error"], str, dict | None]:
-    """Safely remove and reclone repository for faster updates.
-
-    This provides:
-    - Automatic cleanup of old history beyond shallow-since window
-    - Faster than fetch+merge for large repos with accumulated history
-    - Fresh start without merge conflicts
-
-    Safety checks must be performed BEFORE calling this function.
-    """
+    """Safely remove and reclone repository for faster updates."""
     try:
         # Get remote URL before removing
         result = subprocess.run(
@@ -398,7 +257,7 @@ def _reclone_repo(
         )
         remote_url = result.stdout.strip()
 
-        # Get current branch
+        # Get current branch (mostly for logging, reclone will use default unless specified)
         result = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
@@ -408,7 +267,6 @@ def _reclone_repo(
         )
         current_branch = result.stdout.strip()
         if current_branch == "HEAD":
-            # Try to get default branch from remote
             result = subprocess.run(
                 [
                     "git",
@@ -442,7 +300,7 @@ def _reclone_repo(
             clone_cmd,
             capture_output=True,
             text=True,
-            timeout=fetch_timeout * 2,  # Clone may take longer
+            timeout=fetch_timeout * 2,
             check=True,
         )
 
@@ -485,223 +343,70 @@ def run_git_pull(
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
     use_reclone: bool = True,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
-    """Execute git pull with automatic fast-forward/force-push recovery.
+    """Execute git pull using strict reclone strategy."""
 
-    Strategy:
-    1. Check if repo is safe to reclone (no local changes)
-    2. If safe and use_reclone=True: check if updates exist
-    3. If updates exist: remove and reclone (faster, cleaner)
-    4. If no updates: mark as up-to-date (skip reclone)
-    5. If not safe or use_reclone=False: traditional fetch + merge
-
-    Includes pre-flight stale lock cleanup to prevent 'shallow.lock' errors.
-    Always enforces shallow_since when specified.
-    Timeouts and network errors are recorded as 'failed' and move on immediately.
-    Detached HEAD repos fall back to origin/HEAD or skip merge gracefully.
-    """
-    _cleanup_stale_locks(repo_path)
-
-    # Check if we can safely reclone
     if use_reclone and shallow_since:
+        # Step 1: Check Safety (Only uncommitted/stashed work blocks us)
         is_safe, safety_reason = _check_repo_safety_for_reclone(repo_path)
 
-        if is_safe:
-            console.print(f"  [green]✓ Safe to reclone[/green]")
+        if not is_safe:
+            return "error", f"Unsafe to reclone: {safety_reason}", None
 
-            # Get current branch for update check
-            branch = None
+        console.print(f"  [green]✓ Safe to reclone[/green]")
+
+        # Step 2: Get Branch for Update Check
+        branch = None
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            branch = result.stdout.strip()
+            if branch == "HEAD":
+                branch = None
+        except Exception:
+            pass
+
+        if not branch:
             try:
                 result = subprocess.run(
-                    ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
+                    [
+                        "git",
+                        "-C",
+                        str(repo_path),
+                        "symbolic-ref",
+                        "--short",
+                        "refs/remotes/origin/HEAD",
+                    ],
                     capture_output=True,
                     text=True,
                     timeout=5,
                     check=True,
                 )
-                branch = result.stdout.strip()
-                if branch == "HEAD":
-                    branch = None
+                branch = result.stdout.strip().replace("origin/", "")
             except Exception:
-                pass
+                branch = "HEAD"
 
-            if not branch:
-                try:
-                    result = subprocess.run(
-                        [
-                            "git",
-                            "-C",
-                            str(repo_path),
-                            "symbolic-ref",
-                            "--short",
-                            "refs/remotes/origin/HEAD",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                        check=True,
-                    )
-                    branch = result.stdout.strip().replace("origin/", "")
-                except Exception:
-                    branch = "HEAD"
-
-            # Check if there are actually updates to fetch
-            console.print(f"  [dim]Checking for updates on branch '{branch}'...[/dim]")
-            has_updates, update_message = _check_if_updates_available(
-                repo_path, branch, fetch_timeout
-            )
-
-            if not has_updates:
-                console.print(f"  [blue]→ {update_message}[/blue]")
-                shallow_status = _check_shallow_boundary(
-                    repo_path, branch, shallow_since
-                )
-                return "up-to-date", update_message, shallow_status
-            else:
-                console.print(f"  [green]✓ {update_message}[/green]")
-                console.print(f"  [cyan]Proceeding with reclone...[/cyan]")
-                return _reclone_repo(repo_path, shallow_since, fetch_timeout)
-        else:
-            console.print(f"  [yellow]⚠ Cannot reclone: {safety_reason}[/yellow]")
-            console.print(f"  [dim]Falling back to traditional fetch/merge[/dim]")
-
-    # Traditional fetch + merge approach
-    fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
-    if shallow_since:
-        fetch_cmd.extend(["--shallow-since", shallow_since])
-
-    # Try fetch with retry on lock errors
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            subprocess.run(
-                fetch_cmd,
-                capture_output=True,
-                text=True,
-                timeout=fetch_timeout,
-                check=True,
-            )
-            break  # Success, exit retry loop
-        except subprocess.CalledProcessError as e:
-            stderr = _safe_strip(e.stderr)
-
-            # Check if it's a lock-related error
-            if ".lock" in stderr and (
-                "Unable to create" in stderr or "File exists" in stderr
-            ):
-                if attempt < max_retries - 1:
-                    console.print(
-                        f"  [yellow]⚠ Lock error detected, cleaning up and retrying (attempt {attempt + 2})...[/yellow]"
-                    )
-                    # Aggressively clean all locks
-                    _cleanup_stale_locks(repo_path)
-                    continue  # Retry
-                else:
-                    return (
-                        "failed",
-                        f"Fetch failed after {max_retries} attempts due to persistent lock errors: {stderr[:300]}",
-                        None,
-                    )
-            else:
-                # Non-lock error, don't retry
-                return "failed", f"Fetch failed: {stderr}", None
-        except subprocess.TimeoutExpired:
-            return "failed", f"Fetch timed out after {fetch_timeout}s", None
-        except Exception as e:
-            return "failed", f"Fetch exception: {e}", None
-
-    # Continue with merge logic...
-    branch = None
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
+        # Step 3: Check for Updates
+        console.print(f"  [dim]Checking for updates on branch '{branch}'...[/dim]")
+        has_updates, update_message = _check_if_updates_available(
+            repo_path, branch, fetch_timeout
         )
-        branch = result.stdout.strip()
-        if branch == "HEAD":
-            branch = None
-    except Exception:
-        pass
-    if not branch:
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo_path),
-                    "symbolic-ref",
-                    "--short",
-                    "refs/remotes/origin/HEAD",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-            branch = result.stdout.strip().replace("origin/", "")
-        except Exception:
-            shallow_status = _check_shallow_boundary(repo_path, "HEAD", shallow_since)
-            return (
-                "success",
-                "Fetched successfully (detached HEAD, no merge attempted)",
-                shallow_status,
-            )
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "merge", "--ff-only", f"origin/{branch}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-        if "Already up to date" in result.stdout:
+
+        if not has_updates:
+            console.print(f"  [blue]→ {update_message}[/blue]")
             shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
-            return "up-to-date", result.stdout.strip(), shallow_status
-        shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
-        return "success", result.stdout.strip(), shallow_status
-    except subprocess.CalledProcessError as merge_err:
-        merge_stderr = _safe_strip(merge_err.stderr)
-        conflict_indicators = (
-            "CONFLICT",
-            "Automatic merge failed",
-            "Merge conflict",
-            "conflict",
-        )
-        is_conflict = any(
-            ind.lower() in merge_stderr.lower() for ind in conflict_indicators
-        )
-        if is_conflict:
-            try:
-                subprocess.run(
-                    ["git", "-C", str(repo_path), "merge", "--abort"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-            except Exception:
-                pass
-            return (
-                "error",
-                f"Merge conflict on branch '{branch}': {merge_stderr[:300]}",
-                None,
-            )
-    try:
-        subprocess.run(
-            ["git", "-C", str(repo_path), "reset", "--hard", f"origin/{branch}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-        shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
-        return "success", "Hard reset to origin (force-push recovery)", shallow_status
-    except subprocess.CalledProcessError as e:
-        return "failed", f"Reset failed: {_safe_strip(e.stderr)}", None
-    except Exception as e:
-        return "error", f"Exception during reset: {e}", None
+            return "up-to-date", update_message, shallow_status
+        else:
+            console.print(f"  [green]✓ {update_message}[/green]")
+            console.print(f"  [cyan]Proceeding with reclone...[/cyan]")
+            return _reclone_repo(repo_path, shallow_since, fetch_timeout)
+
+    else:
+        return "error", "Reclone optimization disabled or no shallow-since set", None
 
 
 def _write_state_file(state_path: Path, state: dict) -> None:
@@ -736,10 +441,7 @@ def _build_state(
     completed: bool = False,
     previous_state: dict | None = None,
 ) -> dict:
-    """Build the complete state dictionary with proper merging for continue/only-failed.
-    FIX: Deduplicates grouped_results and properly cleans failed entries
-    when repos succeed or become up-to-date in subsequent runs.
-    """
+    """Build the complete state dictionary with proper merging for continue/only-failed."""
     final_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
@@ -834,12 +536,7 @@ def git_pull_all_repos(
 ) -> None:
     """
     Find all git repositories under target_dir and run `git pull` in each.
-    Properly handles state merging for --continue and --only-failed.
-    Uses --shallow-since for time-based shallow fetching.
-    Verifies shallow boundary and records unfetched commit status in state.
-    Merge conflicts are caught and recorded as 'error' status.
-    Uses reclone optimization when safe (no local changes).
-    Smart check: only reclones when updates are actually available.
+    Uses strict reclone optimization when safe (no uncommitted/stashed work).
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
@@ -851,13 +548,14 @@ def git_pull_all_repos(
         state_path = out_path.expanduser().resolve()
     else:
         state_path = base_path / "_git_pull_all_repos_state.json"
+
     mode_line = (
         f'[bold yellow]Shallow mode enabled: --shallow-since="{shallow_since}"[/bold yellow]'
         if shallow_since
         else "[bold yellow]Full history mode (no shallow-since)[/bold yellow]"
     )
     reclone_line = (
-        "[bold green]Reclone optimization: ENABLED (with smart update check)[/bold green]"
+        "[bold green]Strict Reclone: ENABLED[/bold green]"
         if use_reclone and shallow_since
         else "[dim]Reclone optimization: disabled[/dim]"
     )
