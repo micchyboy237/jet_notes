@@ -800,6 +800,7 @@ def git_pull_all_repos(
     continue_from_last: bool = False,
     only_failed: bool = False,
     use_reclone: bool = True,
+    state_path: Path | None = None,
 ) -> None:
     """
     Find all git repositories under target_dir and run `git pull` in each.
@@ -812,10 +813,14 @@ def git_pull_all_repos(
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
-    if out_path is None:
-        state_path = base_path / "_git_pull_all_repos_state.json"
-    else:
+
+    # Determine state file location
+    if state_path is not None:
+        state_path = state_path.expanduser().resolve()
+    elif out_path is not None:
         state_path = out_path.expanduser().resolve()
+    else:
+        state_path = base_path / "_git_pull_all_repos_state.json"
     mode_line = (
         f'[bold yellow]Shallow mode enabled: --shallow-since="{shallow_since}"[/bold yellow]'
         if shallow_since
@@ -1056,6 +1061,14 @@ def main():
         "(default: _git_pull_all_repos_state.json in target directory)",
     )
     parser.add_argument(
+        "--state-path",
+        dest="state_path",
+        type=Path,
+        default=None,
+        help="Custom path for the state JSON file. Overrides --out if both are specified. "
+        "Useful for storing state outside the target directory.",
+    )
+    parser.add_argument(
         "--shallow-since",
         dest="shallow_since",
         type=str,
@@ -1130,6 +1143,7 @@ def main():
         continue_from_last=args.continue_from_last,
         only_failed=args.only_failed,
         use_reclone=use_reclone,
+        state_path=args.state_path,
     )
 
 
