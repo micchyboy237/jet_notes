@@ -67,17 +67,24 @@ def _safe_strip(text: str | bytes | None) -> str:
 
 def _cleanup_stale_locks(repo_path: Path) -> bool:
     """Remove stale git lock files before operations begin.
-    Returns True if a lock was removed, False otherwise.
-    This prevents 'Unable to create shallow.lock' errors from
+    Returns True if any locks were removed, False otherwise.
+    This prevents 'Unable to create *.lock' errors from
     previously interrupted processes.
+
+    Checks for:
+    - Standard locks: shallow.lock, index.lock, HEAD.lock
+    - Ref locks: Any *.lock files under .git/refs/ (e.g., branch lock conflicts)
     """
-    lock_files = [
+    cleaned = False
+
+    # Check standard lock files
+    standard_locks = [
         repo_path / ".git" / "shallow.lock",
         repo_path / ".git" / "index.lock",
         repo_path / ".git" / "HEAD.lock",
     ]
-    cleaned = False
-    for lock_path in lock_files:
+
+    for lock_path in standard_locks:
         if lock_path.exists():
             try:
                 lock_path.unlink(missing_ok=True)
@@ -89,6 +96,30 @@ def _cleanup_stale_locks(repo_path: Path) -> bool:
                 console.print(
                     f"  [red]✗ Failed to remove lock {lock_path.name}: {e}[/red]"
                 )
+
+    # Check for stale ref locks anywhere under .git/refs/
+    # These can occur when git fetch/update-ref is interrupted
+    refs_dir = repo_path / ".git" / "refs"
+    if refs_dir.exists():
+        try:
+            # Find all .lock files recursively under refs/
+            lock_files = list(refs_dir.rglob("*.lock"))
+            for lock_path in lock_files:
+                try:
+                    lock_path.unlink(missing_ok=True)
+                    # Show relative path for clarity
+                    rel_path = lock_path.relative_to(repo_path / ".git")
+                    console.print(
+                        f"  [yellow]⚠ Removed stale ref lock:[/yellow] {rel_path}"
+                    )
+                    cleaned = True
+                except OSError as e:
+                    console.print(
+                        f"  [red]✗ Failed to remove ref lock {lock_path.name}: {e}[/red]"
+                    )
+        except Exception as e:
+            console.print(f"  [yellow]⚠ Could not scan for ref locks: {e}[/yellow]")
+
     return cleaned
 
 
@@ -537,49 +568,48 @@ def run_git_pull(
     fetch_cmd = ["git", "-C", str(repo_path), "fetch"]
     if shallow_since:
         fetch_cmd.extend(["--shallow-since", shallow_since])
-    try:
-        subprocess.run(
-            fetch_cmd,
-            capture_output=True,
-            text=True,
-            timeout=fetch_timeout,
-            check=True,
-        )
-    except subprocess.TimeoutExpired:
-        return "failed", f"Fetch timed out after {fetch_timeout}s", None
-    except subprocess.CalledProcessError as e:
-        stderr = _safe_strip(e.stderr)
-        if "Unable to create" in stderr and ".lock" in stderr:
-            lock_path = repo_path / ".git" / "shallow.lock"
-            if lock_path.exists():
-                try:
-                    lock_path.unlink(missing_ok=True)
+
+    # Try fetch with retry on lock errors
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            subprocess.run(
+                fetch_cmd,
+                capture_output=True,
+                text=True,
+                timeout=fetch_timeout,
+                check=True,
+            )
+            break  # Success, exit retry loop
+        except subprocess.CalledProcessError as e:
+            stderr = _safe_strip(e.stderr)
+
+            # Check if it's a lock-related error
+            if ".lock" in stderr and (
+                "Unable to create" in stderr or "File exists" in stderr
+            ):
+                if attempt < max_retries - 1:
                     console.print(
-                        f"  [green]✓[/green] [dim]Removed stale lock during retry[/dim]"
+                        f"  [yellow]⚠ Lock error detected, cleaning up and retrying (attempt {attempt + 2})...[/yellow]"
                     )
-                    subprocess.run(
-                        fetch_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=fetch_timeout,
-                        check=True,
-                    )
-                except Exception as retry_err:
+                    # Aggressively clean all locks
+                    _cleanup_stale_locks(repo_path)
+                    continue  # Retry
+                else:
                     return (
                         "failed",
-                        f"Fetch failed after emergency lock cleanup: {retry_err}",
+                        f"Fetch failed after {max_retries} attempts due to persistent lock errors: {stderr[:300]}",
                         None,
                     )
             else:
-                return (
-                    "failed",
-                    f"Fetch failed (lock error but no file): {stderr}",
-                    None,
-                )
-        else:
-            return "failed", f"Fetch failed: {stderr}", None
-    except Exception as e:
-        return "failed", f"Fetch exception: {e}", None
+                # Non-lock error, don't retry
+                return "failed", f"Fetch failed: {stderr}", None
+        except subprocess.TimeoutExpired:
+            return "failed", f"Fetch timed out after {fetch_timeout}s", None
+        except Exception as e:
+            return "failed", f"Fetch exception: {e}", None
+
+    # Continue with merge logic...
     branch = None
     try:
         result = subprocess.run(
