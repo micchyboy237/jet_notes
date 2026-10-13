@@ -62,15 +62,12 @@ def _safe_strip(text: str | bytes | None) -> str:
 
 def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     """Check if repository is safe to reclone.
-
     In STRICT mode, we only block if there is UNSAVED WORK that would be lost.
-    We IGNORE local branches, unpushed commits, or detached HEADs because
+    We IGNORE local branches, unpushed commits, detached HEADs, and STASHED changes because
     the reclone will intentionally overwrite them with the remote state.
-
     Returns:
         Tuple of (is_safe, reason_if_unsafe)
     """
-    # Check 1: Uncommitted changes in working directory (CRITICAL)
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "status", "--porcelain"],
@@ -84,7 +81,6 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to check status: {e}"
 
-    # Check 2: Staged changes (CRITICAL)
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "diff", "--cached", "--name-only"],
@@ -98,24 +94,6 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to check staged changes: {e}"
 
-    # Check 3: Stashed changes (CRITICAL - often forgotten work)
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "stash", "list"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-        if result.stdout.strip():
-            stash_count = len(result.stdout.strip().split("\n"))
-            return False, f"Has {stash_count} stashed change(s)"
-    except Exception as e:
-        return False, f"Failed to check stashes: {e}"
-
-    # All checks passed - safe to reclone
-    # Note: We intentionally DO NOT check for local branches or unpushed commits
-    # because the user wants a strict sync with remote.
     return True, ""
 
 
