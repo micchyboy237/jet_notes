@@ -48,7 +48,7 @@ from rich.table import Table
 
 console = Console()
 DEFAULT_SHALLOW_SINCE = "1 year ago"
-DEFAULT_FETCH_TIMEOUT = 60
+DEFAULT_FETCH_TIMEOUT = 30
 
 
 def _safe_strip(text: str | bytes | None) -> str:
