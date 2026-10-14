@@ -1,4 +1,3 @@
-# jet_notes/python_scripts/git_pull_all_repos.py
 """
 git_pull_all_repos.py – Pull all Git repositories under a directory.
 Features:
@@ -8,8 +7,9 @@ Features:
   • STRICT RECLONE: Removes and reclones repos if safe (no uncommitted/stashed work).
     Ignores local branches, unpushed commits, or detached HEADs.
   • SMART CHECK: Only reclones when there are actual updates to fetch.
+  • BACKUP PROTECTION: Creates timestamped backup before reclone; restores on failure.
 Usage examples:
-  # Pull all repos (shallow since 1 year ago, with reclone optimization)
+  # Pull all repos (shallow since 6 months ago, with reclone optimization)
   python git_pull_all_repos.py /path/to/repos
   # Custom time window
   python git_pull_all_repos.py /path/to/repos --shallow-since "6 months ago"
@@ -50,7 +50,7 @@ from rich.progress import (
 from rich.table import Table
 
 console = Console()
-DEFAULT_SHALLOW_SINCE = "1 year ago"
+DEFAULT_SHALLOW_SINCE = "6 months ago"
 DEFAULT_FETCH_TIMEOUT = 60
 
 
@@ -211,13 +211,78 @@ def _check_shallow_boundary(
     return status
 
 
+def _create_backup(repo_path: Path) -> Path | None:
+    """Create a timestamped backup of the repository.
+
+    Returns:
+        Path to backup directory, or None if backup failed
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"{repo_path.name}.backup_{timestamp}"
+        backup_path = repo_path.parent / backup_name
+
+        console.print(f"  [yellow]Creating backup: {backup_name}[/yellow]")
+        shutil.copytree(repo_path, backup_path, symlinks=True)
+
+        console.print(f"  [green]✓ Backup created at: {backup_path}[/green]")
+        return backup_path
+    except Exception as e:
+        console.print(f"  [red]✗ Failed to create backup: {e}[/red]")
+        return None
+
+
+def _restore_from_backup(backup_path: Path, repo_path: Path) -> bool:
+    """Restore repository from backup.
+
+    Returns:
+        True if restoration succeeded, False otherwise
+    """
+    try:
+        if not backup_path.exists():
+            console.print(f"  [red]✗ Backup not found: {backup_path}[/red]")
+            return False
+
+        console.print(f"  [yellow]Restoring from backup...[/yellow]")
+
+        # Remove failed clone attempt if it exists
+        if repo_path.exists():
+            shutil.rmtree(repo_path)
+
+        # Restore from backup
+        shutil.copytree(backup_path, repo_path, symlinks=True)
+
+        console.print(f"  [green]✓ Repository restored from backup[/green]")
+        return True
+    except Exception as e:
+        console.print(f"  [red]✗ Failed to restore from backup: {e}[/red]")
+        return False
+
+
+def _cleanup_backup(backup_path: Path) -> None:
+    """Clean up backup directory after successful reclone."""
+    try:
+        if backup_path.exists():
+            shutil.rmtree(backup_path)
+            console.print(f"  [dim]Backup cleaned up: {backup_path.name}[/dim]")
+    except Exception as e:
+        console.print(f"  [yellow]Warning: Could not clean up backup: {e}[/yellow]")
+
+
 def _reclone_repo(
     repo_path: Path,
     shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[Literal["success", "failed", "error"], str, dict | None]:
-    """Safely remove and reclone repository for faster updates."""
+    """Safely remove and reclone repository for faster updates.
+
+    Creates a backup before removal and restores it if cloning fails.
+    Handles corrupted/empty repositories gracefully.
+    """
+    backup_path = None
+
     try:
+        # Get remote URL first
         result = subprocess.run(
             ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
             capture_output=True,
@@ -226,37 +291,64 @@ def _reclone_repo(
             check=True,
         )
         remote_url = result.stdout.strip()
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-        current_branch = result.stdout.strip()
-        if current_branch == "HEAD":
+
+        # Try to get current branch, handle corrupted repos
+        current_branch = None
+        try:
             result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo_path),
-                    "symbolic-ref",
-                    "--short",
-                    "refs/remotes/origin/HEAD",
-                ],
+                ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 check=True,
             )
-            current_branch = result.stdout.strip().replace("origin/", "")
-        console.print(f"  [dim]Remote: {remote_url}, Branch: {current_branch}[/dim]")
+            current_branch = result.stdout.strip()
+
+            # Handle detached HEAD
+            if current_branch == "HEAD":
+                try:
+                    result = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo_path),
+                            "symbolic-ref",
+                            "--short",
+                            "refs/remotes/origin/HEAD",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=True,
+                    )
+                    current_branch = result.stdout.strip().replace("origin/", "")
+                except subprocess.CalledProcessError:
+                    current_branch = None
+        except subprocess.CalledProcessError:
+            # Repo might be empty or corrupted - that's OK, we'll reclone
+            console.print(
+                f"  [dim]Could not determine branch (repo may be empty/corrupted)[/dim]"
+            )
+            current_branch = None
+
+        console.print(
+            f"  [dim]Remote: {remote_url}, Branch: {current_branch or 'default'}[/dim]"
+        )
+
+        # Create backup before removing
+        backup_path = _create_backup(repo_path)
+        if backup_path is None:
+            return "error", "Failed to create backup, aborting reclone", None
+
         console.print(f"  [cyan]Removing old repository...[/cyan]")
         shutil.rmtree(repo_path)
+
+        # Clone fresh
         clone_cmd = ["git", "clone"]
         if shallow_since:
             clone_cmd.extend(["--shallow-since", shallow_since])
         clone_cmd.extend([remote_url, str(repo_path)])
+
         console.print(f"  [cyan]Cloning with shallow-since='{shallow_since}'...[/cyan]")
         result = subprocess.run(
             clone_cmd,
@@ -265,6 +357,8 @@ def _reclone_repo(
             timeout=fetch_timeout * 2,
             check=True,
         )
+
+        # Checkout specific branch if needed
         if current_branch and current_branch not in ("master", "main"):
             try:
                 subprocess.run(
@@ -275,21 +369,59 @@ def _reclone_repo(
                     check=True,
                 )
             except subprocess.CalledProcessError:
-                pass
+                console.print(
+                    f"  [yellow]Warning: Could not checkout branch '{current_branch}'[/yellow]"
+                )
+
+        # Check shallow boundary
         shallow_status = _check_shallow_boundary(
             repo_path, current_branch or "HEAD", shallow_since
         )
+
+        # Success! Clean up backup
+        _cleanup_backup(backup_path)
+
         return (
             "success",
-            f"Recloned successfully (branch: {current_branch})",
+            f"Recloned successfully (branch: {current_branch or 'default'})",
             shallow_status,
         )
+
     except subprocess.TimeoutExpired:
+        # Restore from backup on timeout
+        if backup_path:
+            _restore_from_backup(backup_path, repo_path)
+            _cleanup_backup(backup_path)
         return "failed", f"Clone timed out after {fetch_timeout * 2}s", None
+
     except subprocess.CalledProcessError as e:
         stderr = _safe_strip(e.stderr)
+
+        # Restore from backup on clone failure
+        if backup_path:
+            console.print(f"  [yellow]Clone failed, restoring from backup...[/yellow]")
+            _restore_from_backup(backup_path, repo_path)
+            _cleanup_backup(backup_path)
+
+        # Special handling for HEAD ambiguity errors
+        if "ambiguous argument 'HEAD'" in stderr or "unknown revision" in stderr:
+            return (
+                "failed",
+                f"Repository was corrupted/empty (HEAD error). Backed up and restored. Original error: {stderr[:200]}",
+                None,
+            )
+
         return "failed", f"Clone failed: {stderr[:300]}", None
+
     except Exception as e:
+        # Restore from backup on any other exception
+        if backup_path:
+            console.print(
+                f"  [yellow]Exception occurred, restoring from backup...[/yellow]"
+            )
+            _restore_from_backup(backup_path, repo_path)
+            _cleanup_backup(backup_path)
+
         return "error", f"Reclone exception: {e}", None
 
 
@@ -307,7 +439,6 @@ def run_git_pull(
             if not is_safe:
                 return "error", f"Unsafe to reclone: {safety_reason}", None
             console.print(f"  [green]✓ Safe to reclone[/green]")
-
         branch = None
         try:
             result = subprocess.run(
@@ -486,6 +617,7 @@ def git_pull_all_repos(
     """
     Find all git repositories under target_dir and run `git pull` in each.
     Uses strict reclone optimization when safe (no uncommitted/stashed work).
+    Creates backups before recloning and restores on failure.
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
@@ -510,6 +642,7 @@ def git_pull_all_repos(
         if check_safety
         else "[dim]Safety Check: disabled (faster)[/dim]"
     )
+    backup_line = "[bold cyan]Backup Protection: ENABLED[/bold cyan]"
     if continue_from_last:
         console.print(
             "[bold cyan]Mode: Continue from last unprocessed repo[/bold cyan]"
@@ -521,6 +654,7 @@ def git_pull_all_repos(
         f"{mode_line}\n"
         f"{reclone_line}\n"
         f"{safety_line}\n"
+        f"{backup_line}\n"
     )
     console.print(f"[dim]State file: {state_path}[/dim]\n")
     processed_repos: set[str] = set()
@@ -830,6 +964,7 @@ def main():
         "[bold]Safety Check:[/bold] "
         + ("[magenta]Enabled[/magenta]" if args.check_safety else "[dim]Disabled[/dim]")
     )
+    console.print("[bold]Backup Protection:[/bold] [cyan]Enabled[/cyan]")
     git_pull_all_repos(
         args.target_dir,
         out_path=out_path,
