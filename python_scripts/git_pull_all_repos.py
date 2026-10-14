@@ -1,3 +1,4 @@
+# jet_notes/python_scripts/git_pull_all_repos.py
 """
 git_pull_all_repos.py – Pull all Git repositories under a directory.
 Features:
@@ -22,6 +23,8 @@ Usage examples:
   python git_pull_all_repos.py /path/to/repos -s desc -o state.json
   # Disable reclone optimization (use traditional fetch/merge)
   python git_pull_all_repos.py /path/to/repos --no-reclone
+  # Enable safety checks before recloning (default: disabled for speed)
+  python git_pull_all_repos.py /path/to/repos --check-safety
 """
 
 from __future__ import annotations
@@ -80,7 +83,6 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
             return False, "Has uncommitted changes in working directory"
     except Exception as e:
         return False, f"Failed to check status: {e}"
-
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "diff", "--cached", "--name-only"],
@@ -93,7 +95,6 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
             return False, "Has staged changes not yet committed"
     except Exception as e:
         return False, f"Failed to check staged changes: {e}"
-
     return True, ""
 
 
@@ -104,7 +105,6 @@ def _check_if_updates_available(
 ) -> tuple[bool, str]:
     """Check if there are actually updates to fetch from remote."""
     try:
-        # Fetch remote refs without merging (fast operation)
         result = subprocess.run(
             ["git", "-C", str(repo_path), "fetch", "--dry-run"],
             capture_output=True,
@@ -112,8 +112,6 @@ def _check_if_updates_available(
             timeout=fetch_timeout,
             check=True,
         )
-
-        # Check if there are any new commits
         if result.stderr or result.stdout:
             combined_output = (result.stdout + result.stderr).lower()
             if any(
@@ -130,8 +128,6 @@ def _check_if_updates_available(
                 ]
             ):
                 return True, "Updates available from remote"
-
-        # Double-check by comparing local vs remote commit hashes
         try:
             local_hash = subprocess.run(
                 ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
@@ -140,7 +136,6 @@ def _check_if_updates_available(
                 timeout=5,
                 check=True,
             ).stdout.strip()
-
             remote_hash = subprocess.run(
                 ["git", "-C", str(repo_path), "rev-parse", f"origin/{branch}"],
                 capture_output=True,
@@ -148,7 +143,6 @@ def _check_if_updates_available(
                 timeout=5,
                 check=True,
             ).stdout.strip()
-
             if local_hash != remote_hash:
                 return (
                     True,
@@ -158,7 +152,6 @@ def _check_if_updates_available(
                 return False, "Already up to date"
         except Exception:
             return True, "Cannot verify, assuming updates available"
-
     except subprocess.TimeoutExpired:
         return True, "Fetch timed out, will attempt reclone"
     except Exception as e:
@@ -225,7 +218,6 @@ def _reclone_repo(
 ) -> tuple[Literal["success", "failed", "error"], str, dict | None]:
     """Safely remove and reclone repository for faster updates."""
     try:
-        # Get remote URL before removing
         result = subprocess.run(
             ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
             capture_output=True,
@@ -234,8 +226,6 @@ def _reclone_repo(
             check=True,
         )
         remote_url = result.stdout.strip()
-
-        # Get current branch (mostly for logging, reclone will use default unless specified)
         result = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
@@ -260,19 +250,13 @@ def _reclone_repo(
                 check=True,
             )
             current_branch = result.stdout.strip().replace("origin/", "")
-
         console.print(f"  [dim]Remote: {remote_url}, Branch: {current_branch}[/dim]")
-
-        # Remove the entire repository directory
         console.print(f"  [cyan]Removing old repository...[/cyan]")
         shutil.rmtree(repo_path)
-
-        # Clone with shallow-since
         clone_cmd = ["git", "clone"]
         if shallow_since:
             clone_cmd.extend(["--shallow-since", shallow_since])
         clone_cmd.extend([remote_url, str(repo_path)])
-
         console.print(f"  [cyan]Cloning with shallow-since='{shallow_since}'...[/cyan]")
         result = subprocess.run(
             clone_cmd,
@@ -281,8 +265,6 @@ def _reclone_repo(
             timeout=fetch_timeout * 2,
             check=True,
         )
-
-        # Checkout the correct branch if needed
         if current_branch and current_branch not in ("master", "main"):
             try:
                 subprocess.run(
@@ -293,19 +275,15 @@ def _reclone_repo(
                     check=True,
                 )
             except subprocess.CalledProcessError:
-                pass  # Branch may not exist on remote
-
-        # Verify the clone
+                pass
         shallow_status = _check_shallow_boundary(
             repo_path, current_branch or "HEAD", shallow_since
         )
-
         return (
             "success",
             f"Recloned successfully (branch: {current_branch})",
             shallow_status,
         )
-
     except subprocess.TimeoutExpired:
         return "failed", f"Clone timed out after {fetch_timeout * 2}s", None
     except subprocess.CalledProcessError as e:
@@ -320,19 +298,16 @@ def run_git_pull(
     shallow_since: str | None = DEFAULT_SHALLOW_SINCE,
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
     use_reclone: bool = True,
+    check_safety: bool = False,
 ) -> tuple[Literal["success", "up-to-date", "failed", "error"], str, dict | None]:
     """Execute git pull using strict reclone strategy."""
-
     if use_reclone and shallow_since:
-        # Step 1: Check Safety (Only uncommitted/stashed work blocks us)
-        is_safe, safety_reason = _check_repo_safety_for_reclone(repo_path)
+        if check_safety:
+            is_safe, safety_reason = _check_repo_safety_for_reclone(repo_path)
+            if not is_safe:
+                return "error", f"Unsafe to reclone: {safety_reason}", None
+            console.print(f"  [green]✓ Safe to reclone[/green]")
 
-        if not is_safe:
-            return "error", f"Unsafe to reclone: {safety_reason}", None
-
-        console.print(f"  [green]✓ Safe to reclone[/green]")
-
-        # Step 2: Get Branch for Update Check
         branch = None
         try:
             result = subprocess.run(
@@ -347,7 +322,6 @@ def run_git_pull(
                 branch = None
         except Exception:
             pass
-
         if not branch:
             try:
                 result = subprocess.run(
@@ -367,13 +341,10 @@ def run_git_pull(
                 branch = result.stdout.strip().replace("origin/", "")
             except Exception:
                 branch = "HEAD"
-
-        # Step 3: Check for Updates
         console.print(f"  [dim]Checking for updates on branch '{branch}'...[/dim]")
         has_updates, update_message = _check_if_updates_available(
             repo_path, branch, fetch_timeout
         )
-
         if not has_updates:
             console.print(f"  [blue]→ {update_message}[/blue]")
             shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
@@ -382,7 +353,6 @@ def run_git_pull(
             console.print(f"  [green]✓ {update_message}[/green]")
             console.print(f"  [cyan]Proceeding with reclone...[/cyan]")
             return _reclone_repo(repo_path, shallow_since, fetch_timeout)
-
     else:
         return "error", "Reclone optimization disabled or no shallow-since set", None
 
@@ -511,6 +481,7 @@ def git_pull_all_repos(
     only_failed: bool = False,
     use_reclone: bool = True,
     state_path: Path | None = None,
+    check_safety: bool = False,
 ) -> None:
     """
     Find all git repositories under target_dir and run `git pull` in each.
@@ -518,15 +489,12 @@ def git_pull_all_repos(
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
-
-    # Determine state file location
     if state_path is not None:
         state_path = state_path.expanduser().resolve()
     elif out_path is not None:
         state_path = out_path.expanduser().resolve()
     else:
         state_path = base_path / "_git_pull_all_repos_state.json"
-
     mode_line = (
         f'[bold yellow]Shallow mode enabled: --shallow-since="{shallow_since}"[/bold yellow]'
         if shallow_since
@@ -536,6 +504,11 @@ def git_pull_all_repos(
         "[bold green]Strict Reclone: ENABLED[/bold green]"
         if use_reclone and shallow_since
         else "[dim]Reclone optimization: disabled[/dim]"
+    )
+    safety_line = (
+        "[bold magenta]Safety Check: ENABLED[/bold magenta]"
+        if check_safety
+        else "[dim]Safety Check: disabled (faster)[/dim]"
     )
     if continue_from_last:
         console.print(
@@ -547,6 +520,7 @@ def git_pull_all_repos(
         f"[bold cyan]Scanning for git repositories in:[/bold cyan] {base_path}\n"
         f"{mode_line}\n"
         f"{reclone_line}\n"
+        f"{safety_line}\n"
     )
     console.print(f"[dim]State file: {state_path}[/dim]\n")
     processed_repos: set[str] = set()
@@ -669,7 +643,10 @@ def git_pull_all_repos(
             repo_key = str(repo)
             progress.update(task, description=f"[cyan]Pulling {short_name}...")
             status, message, shallow_status = run_git_pull(
-                repo, shallow_since=shallow_since, use_reclone=use_reclone
+                repo,
+                shallow_since=shallow_since,
+                use_reclone=use_reclone,
+                check_safety=check_safety,
             )
             stats[status] += 1
             progress_data[repo_key] = {
@@ -813,6 +790,14 @@ def main():
         action="store_true",
         help="Disable reclone optimization (use traditional fetch/merge only)",
     )
+    parser.add_argument(
+        "--check-safety",
+        dest="check_safety",
+        action="store_true",
+        default=False,
+        help="Enable safety checks before recloning (checks for uncommitted/staged changes). "
+        "Disabled by default for performance.",
+    )
     args = parser.parse_args()
     target_dir = Path(args.target_dir).expanduser().resolve()
     if args.out is not None:
@@ -841,6 +826,10 @@ def main():
         "[bold]Reclone:[/bold] "
         + ("[green]Enabled[/green]" if use_reclone else "[dim]Disabled[/dim]")
     )
+    console.print(
+        "[bold]Safety Check:[/bold] "
+        + ("[magenta]Enabled[/magenta]" if args.check_safety else "[dim]Disabled[/dim]")
+    )
     git_pull_all_repos(
         args.target_dir,
         out_path=out_path,
@@ -850,6 +839,7 @@ def main():
         only_failed=args.only_failed,
         use_reclone=use_reclone,
         state_path=args.state_path,
+        check_safety=args.check_safety,
     )
 
 
