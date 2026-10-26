@@ -9,10 +9,10 @@ Features:
   • SMART CHECK: Only reclones when there are actual updates to fetch.
   • BACKUP PROTECTION: Creates timestamped backup before reclone; restores on failure.
 Usage examples:
-  # Pull all repos (shallow since 6 months ago, with reclone optimization)
+  # Pull all repos (shallow since 3 months ago, with reclone optimization)
   python git_pull_all_repos.py /path/to/repos
   # Custom time window
-  python git_pull_all_repos.py /path/to/repos --shallow-since "6 months ago"
+  python git_pull_all_repos.py /path/to/repos --shallow-since "3 months ago"
   # Full history fetch
   python git_pull_all_repos.py /path/to/repos --shallow-since full
   # Resume after interruption
@@ -50,7 +50,7 @@ from rich.progress import (
 from rich.table import Table
 
 console = Console()
-DEFAULT_SHALLOW_SINCE = "6 months ago"
+DEFAULT_SHALLOW_SINCE = "3 months ago"
 DEFAULT_FETCH_TIMEOUT = 60
 
 
