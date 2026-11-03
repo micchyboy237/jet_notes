@@ -6,7 +6,7 @@ from pathlib import Path
 from mitmproxy import http
 
 # Setup output directory
-OUTPUT_DIR = Path(__file__).parent / "generated" / Path(__file__).stem
+OUTPUT_DIR = Path(__file__).parent / "generated" / "llamacpp_logs"
 shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
