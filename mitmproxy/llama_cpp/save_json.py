@@ -48,7 +48,6 @@ def parse_sse_stream(resp_body_str: str):
     """
     full_content = []
     reasoning_content = []
-    # Structure: { index: { id: str, type: str, name: str, arguments: str } }
     tool_calls_map = {}
     final_usage = None
 
@@ -56,31 +55,36 @@ def parse_sse_stream(resp_body_str: str):
         return "", "", [], None
 
     lines = resp_body_str.strip().split("\n")
-
     for line in lines:
         if not line.startswith("data: "):
             continue
-
         data_str = line[6:]
         if data_str == "[DONE]":
             break
 
         chunk = safe_json_loads(data_str)
-        if not chunk or "choices" not in chunk:
+        if not chunk:
+            continue
+
+        # Check for usage/timings FIRST, before accessing choices
+        if "usage" in chunk:
+            final_usage = chunk["usage"]
+        if "timings" in chunk:
+            if final_usage is None:
+                final_usage = {}
+            final_usage["timings"] = chunk["timings"]
+
+        # Skip further processing if no choices
+        if "choices" not in chunk or not chunk["choices"]:
             continue
 
         choice = chunk["choices"][0]
         delta = choice.get("delta", {})
 
-        # 1. Extract Content
         if "content" in delta and delta["content"] is not None:
             full_content.append(delta["content"])
-
-        # 2. Extract Reasoning Content (specific to some models/versions)
         if "reasoning_content" in delta and delta["reasoning_content"] is not None:
             reasoning_content.append(delta["reasoning_content"])
-
-        # 3. Extract Tool Calls
         if "tool_calls" in delta and delta["tool_calls"]:
             for tc in delta["tool_calls"]:
                 idx = tc.get("index", 0)
@@ -91,28 +95,18 @@ def parse_sse_stream(resp_body_str: str):
                         "name": None,
                         "arguments": "",
                     }
-
                 func_info = tc.get("function", {})
                 if "name" in func_info:
                     tool_calls_map[idx]["name"] = func_info["name"]
                 if "arguments" in func_info:
                     tool_calls_map[idx]["arguments"] += func_info["arguments"]
 
-        # 4. Extract Usage/Timings from the last chunk
-        if "usage" in chunk:
-            final_usage = chunk["usage"]
-        if "timings" in chunk:
-            if final_usage is None:
-                final_usage = {}
-            final_usage["timings"] = chunk["timings"]
-
-    # Post-process tool calls: try to parse arguments as JSON
     structured_tool_calls = []
     for tc in tool_calls_map.values():
         try:
             tc["arguments"] = json.loads(tc["arguments"])
         except json.JSONDecodeError:
-            pass  # Keep as string if invalid JSON
+            pass
         structured_tool_calls.append(tc)
 
     return (
