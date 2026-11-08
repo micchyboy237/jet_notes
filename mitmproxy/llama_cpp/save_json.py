@@ -121,29 +121,25 @@ def process_chat_completion(flow: http.HTTPFlow, req_dir: Path):
     """
     Parse and save llama.cpp /v1/chat/completions specific structures.
     """
-    # --- 1. Process Request Body ---
     req_body_str = flow.request.get_text() if flow.request.content else None
     req_data = safe_json_loads(req_body_str)
 
-    # Save raw request body
-    if req_body_str:
+    # Save formatted JSON if valid, otherwise save raw string as fallback
+    if req_data:
+        save_json_file(req_dir / "request_body" / "raw.json", req_data)
+    elif req_body_str:
+        # Fallback: if it's not valid JSON, save the raw string anyway
         save_file(req_dir / "request_body" / "raw.json", req_body_str)
 
     if req_data:
-        # Save structured tools if present
         if "tools" in req_data:
             save_json_file(req_dir / "request_body" / "tools.json", req_data["tools"])
-
-        # Save messages as individual markdown files
         if "messages" in req_data and isinstance(req_data["messages"], list):
             messages_dir = req_dir / "request_body" / "messages"
             messages_dir.mkdir(parents=True, exist_ok=True)
-
             for i, msg in enumerate(req_data["messages"]):
                 role = msg.get("role", "unknown")
                 content = msg.get("content", "")
-
-                # Handle tool calls in assistant messages (Request side)
                 if role == "assistant" and "tool_calls" in msg:
                     tool_calls_str = (
                         "\n\n**Tool Calls:**\n```json\n"
@@ -154,15 +150,12 @@ def process_chat_completion(flow: http.HTTPFlow, req_dir: Path):
                         content += tool_calls_str
                     else:
                         content = tool_calls_str
-
-                # Handle tool results
                 if role == "tool":
                     tool_id = msg.get("tool_call_id", "unknown")
                     header = f"**Tool Result ID:** `{tool_id}`\n\n"
                     content = header + (
                         content if isinstance(content, str) else json.dumps(content)
                     )
-
                 filename = f"{i + 1:02d}_{role}.md"
                 save_file(messages_dir / filename, str(content))
 
