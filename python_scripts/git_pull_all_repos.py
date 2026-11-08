@@ -9,6 +9,7 @@ Features:
   • SMART CHECK: Only reclones when there are actual updates to fetch.
   • BACKUP PROTECTION: Creates timestamped backup before reclone; restores on failure.
   • DYNAMIC SHALLOW: Adjusts shallow-since to match remote tip if remote is older than window.
+  • EXCLUSION: Supports excluding specific repos by name, relative path, or absolute path.
 Usage examples:
   # Pull all repos (shallow since 3 months ago, with reclone optimization)
   python git_pull_all_repos.py /path/to/repos
@@ -26,6 +27,8 @@ Usage examples:
   python git_pull_all_repos.py /path/to/repos --no-reclone
   # Enable safety checks before recloning (default: disabled for speed)
   python git_pull_all_repos.py /path/to/repos --check-safety
+  # Exclude specific repositories
+  python git_pull_all_repos.py /path/to/repos --exclude "temp-repo,old-project"
 """
 
 from __future__ import annotations
@@ -713,6 +716,7 @@ def git_pull_all_repos(
     use_reclone: bool = True,
     state_path: Path | None = None,
     check_safety: bool = False,
+    exclude: list[str] | None = None,
 ) -> None:
     """
     Find all git repositories under target_dir and run `git pull` in each.
@@ -728,6 +732,9 @@ def git_pull_all_repos(
         state_path = out_path.expanduser().resolve()
     else:
         state_path = base_path / "_git_pull_all_repos_state.json"
+
+    if exclude is None:
+        exclude = []
 
     mode_line = (
         f'[bold yellow]Shallow mode enabled: --shallow-since="{shallow_since}"[/bold yellow]'
@@ -760,6 +767,10 @@ def git_pull_all_repos(
         f"{safety_line}\n"
         f"{backup_line}\n"
     )
+
+    if exclude:
+        console.print(f"[bold yellow]Excluding:[/bold yellow] {', '.join(exclude)}\n")
+
     console.print(f"[dim]State file: {state_path}[/dim]\n")
 
     processed_repos: set[str] = set()
@@ -795,6 +806,41 @@ def git_pull_all_repos(
             check_remote_tracking=True,
         )
     )
+
+    # Filter out excluded repos
+    if exclude:
+        initial_count = len(repos)
+        filtered_repos = []
+        for repo in repos:
+            repo_name = repo.name
+            repo_rel_path = str(repo.path.relative_to(base_path))
+            repo_abs_path = str(repo.path)
+
+            is_excluded = False
+            for pattern in exclude:
+                # 1. Check if pattern is in repo name (e.g., "playwright")
+                # 2. Check if pattern is in relative path (e.g., "libs/playwright")
+                # 3. Check if pattern is in absolute path (for absolute path exclusions)
+                # 4. Check if repo abs path ends with pattern (for partial absolute paths)
+                if (
+                    pattern in repo_name
+                    or pattern in repo_rel_path
+                    or pattern in repo_abs_path
+                    or repo_abs_path.endswith(pattern)
+                ):
+                    is_excluded = True
+                    break
+
+            if not is_excluded:
+                filtered_repos.append(repo)
+            else:
+                console.print(f"[dim]Excluded: {repo_name}[/dim]")
+
+        repos = filtered_repos
+        if len(repos) < initial_count:
+            console.print(
+                f"[dim]Filtered out {initial_count - len(repos)} excluded repositories.[/dim]\n"
+            )
 
     if only_failed and previous_state:
         failed_paths = {entry["repoPath"] for entry in previous_state.get("failed", [])}
@@ -1061,6 +1107,13 @@ def main():
         help="Enable safety checks before recloning (checks for uncommitted/staged changes). "
         "Disabled by default for performance.",
     )
+    parser.add_argument(
+        "--exclude",
+        dest="exclude",
+        type=str,
+        default="",
+        help="Comma-separated list of repository names or relative paths to exclude.",
+    )
 
     args = parser.parse_args()
     target_dir = Path(args.target_dir).expanduser().resolve()
@@ -1077,6 +1130,13 @@ def main():
         shallow_since_value = None
 
     use_reclone = not args.no_reclone
+
+    # Process exclude list
+    exclude_list = (
+        [e.strip() for e in args.exclude.split(",") if e.strip()]
+        if args.exclude
+        else []
+    )
 
     console.print(
         f"[bold]Target directory:[/bold] [link=file://{target_dir}]{target_dir}[/link]"
@@ -1110,6 +1170,7 @@ def main():
         use_reclone=use_reclone,
         state_path=args.state_path,
         check_safety=args.check_safety,
+        exclude=exclude_list,
     )
 
 
