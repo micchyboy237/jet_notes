@@ -8,6 +8,7 @@ Features:
     Ignores local branches, unpushed commits, or detached HEADs.
   • SMART CHECK: Only reclones when there are actual updates to fetch.
   • BACKUP PROTECTION: Creates timestamped backup before reclone; restores on failure.
+  • DYNAMIC SHALLOW: Adjusts shallow-since to match remote tip if remote is older than window.
 Usage examples:
   # Pull all repos (shallow since 3 months ago, with reclone optimization)
   python git_pull_all_repos.py /path/to/repos
@@ -33,7 +34,7 @@ import argparse
 import json
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -63,6 +64,67 @@ def _safe_strip(text: str | bytes | None) -> str:
     return str(text).strip()
 
 
+def _parse_shallow_since_to_date(shallow_since_str: str) -> datetime | None:
+    """
+    Convert a human-readable date string (e.g., '3 months ago') to a datetime object.
+    Uses git rev-parse for accurate parsing relative to now.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--since", shallow_since_str],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        # Output is typically a timestamp like 1678886400
+        timestamp = int(result.stdout.strip())
+        return datetime.fromtimestamp(timestamp)
+    except Exception:
+        return None
+
+
+def _get_remote_latest_commit_info(
+    repo_path: Path, branch: str, timeout: int = 10
+) -> tuple[str | None, str | None]:
+    """
+    Fetch only the latest commit from remote to get its hash and date.
+    Returns:
+        Tuple of (commit_hash, author_date_iso)
+    """
+    try:
+        # Fetch only the latest commit for the specific branch
+        subprocess.run(
+            ["git", "-C", str(repo_path), "fetch", "--depth=1", "origin", branch],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        )
+        # Get hash and author date of the fetched remote head
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "log",
+                "-1",
+                "--format=%H %aI",
+                f"origin/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        parts = result.stdout.strip().split()
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+        return None, None
+    except Exception:
+        return None, None
+
+
 def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
     """Check if repository is safe to reclone.
     In STRICT mode, we only block if there is UNSAVED WORK that would be lost.
@@ -83,6 +145,7 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
             return False, "Has uncommitted changes in working directory"
     except Exception as e:
         return False, f"Failed to check status: {e}"
+
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "diff", "--cached", "--name-only"],
@@ -95,6 +158,7 @@ def _check_repo_safety_for_reclone(repo_path: Path) -> tuple[bool, str]:
             return False, "Has staged changes not yet committed"
     except Exception as e:
         return False, f"Failed to check staged changes: {e}"
+
     return True, ""
 
 
@@ -128,6 +192,7 @@ def _check_if_updates_available(
                 ]
             ):
                 return True, "Updates available from remote"
+
         try:
             local_hash = subprocess.run(
                 ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
@@ -143,6 +208,7 @@ def _check_if_updates_available(
                 timeout=5,
                 check=True,
             ).stdout.strip()
+
             if local_hash != remote_hash:
                 return (
                     True,
@@ -152,6 +218,7 @@ def _check_if_updates_available(
                 return False, "Already up to date"
         except Exception:
             return True, "Cannot verify, assuming updates available"
+
     except subprocess.TimeoutExpired:
         return True, "Fetch timed out, will attempt reclone"
     except Exception as e:
@@ -172,6 +239,7 @@ def _check_shallow_boundary(
     if not shallow_since:
         status["remote_has_unfetched"] = False
         return status
+
     try:
         local_result = subprocess.run(
             ["git", "-C", str(repo_path), "log", "-1", "--format=%aI", "HEAD"],
@@ -183,6 +251,8 @@ def _check_shallow_boundary(
         status["local_tip_date"] = local_result.stdout.strip() or None
     except Exception:
         pass
+
+    # Try to get remote date from existing refs first
     try:
         remote_result = subprocess.run(
             [
@@ -201,7 +271,10 @@ def _check_shallow_boundary(
         )
         status["remote_tip_date"] = remote_result.stdout.strip() or None
     except Exception:
+        # If we can't see the remote ref locally, we might need to fetch it
+        # But for boundary check, we'll leave it as None if not available
         pass
+
     if status["local_tip_date"] and status["remote_tip_date"]:
         status["remote_has_unfetched"] = (
             status["local_tip_date"] != status["remote_tip_date"]
@@ -213,7 +286,6 @@ def _check_shallow_boundary(
 
 def _create_backup(repo_path: Path) -> Path | None:
     """Create a timestamped backup of the repository.
-
     Returns:
         Path to backup directory, or None if backup failed
     """
@@ -221,10 +293,8 @@ def _create_backup(repo_path: Path) -> Path | None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = f"{repo_path.name}.backup_{timestamp}"
         backup_path = repo_path.parent / backup_name
-
         console.print(f"  [yellow]Creating backup: {backup_name}[/yellow]")
         shutil.copytree(repo_path, backup_path, symlinks=True)
-
         console.print(f"  [green]✓ Backup created at: {backup_path}[/green]")
         return backup_path
     except Exception as e:
@@ -234,7 +304,6 @@ def _create_backup(repo_path: Path) -> Path | None:
 
 def _restore_from_backup(backup_path: Path, repo_path: Path) -> bool:
     """Restore repository from backup.
-
     Returns:
         True if restoration succeeded, False otherwise
     """
@@ -244,14 +313,9 @@ def _restore_from_backup(backup_path: Path, repo_path: Path) -> bool:
             return False
 
         console.print(f"  [yellow]Restoring from backup...[/yellow]")
-
-        # Remove failed clone attempt if it exists
         if repo_path.exists():
             shutil.rmtree(repo_path)
-
-        # Restore from backup
         shutil.copytree(backup_path, repo_path, symlinks=True)
-
         console.print(f"  [green]✓ Repository restored from backup[/green]")
         return True
     except Exception as e:
@@ -275,14 +339,14 @@ def _reclone_repo(
     fetch_timeout: int = DEFAULT_FETCH_TIMEOUT,
 ) -> tuple[Literal["success", "failed", "error"], str, dict | None]:
     """Safely remove and reclone repository for faster updates.
-
     Creates a backup before removal and restores it if cloning fails.
     Handles corrupted/empty repositories gracefully.
+    Implements dynamic shallow-since adjustment to avoid full clones.
     """
     backup_path = None
+    final_shallow_since = shallow_since
 
     try:
-        # Get remote URL first
         result = subprocess.run(
             ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
             capture_output=True,
@@ -292,7 +356,6 @@ def _reclone_repo(
         )
         remote_url = result.stdout.strip()
 
-        # Try to get current branch, handle corrupted repos
         current_branch = None
         try:
             result = subprocess.run(
@@ -303,8 +366,6 @@ def _reclone_repo(
                 check=True,
             )
             current_branch = result.stdout.strip()
-
-            # Handle detached HEAD
             if current_branch == "HEAD":
                 try:
                     result = subprocess.run(
@@ -325,7 +386,6 @@ def _reclone_repo(
                 except subprocess.CalledProcessError:
                     current_branch = None
         except subprocess.CalledProcessError:
-            # Repo might be empty or corrupted - that's OK, we'll reclone
             console.print(
                 f"  [dim]Could not determine branch (repo may be empty/corrupted)[/dim]"
             )
@@ -335,7 +395,47 @@ def _reclone_repo(
             f"  [dim]Remote: {remote_url}, Branch: {current_branch or 'default'}[/dim]"
         )
 
-        # Create backup before removing
+        # --- DYNAMIC SHALLOW SINCE CALCULATION ---
+        effective_shallow_since = shallow_since
+        if shallow_since and current_branch:
+            console.print(
+                f"  [dim]Checking remote tip for shallow-since adjustment...[/dim]"
+            )
+            remote_hash, remote_date_iso = _get_remote_latest_commit_info(
+                repo_path, current_branch
+            )
+
+            if remote_date_iso:
+                try:
+                    # Parse remote date
+                    # Format: 2023-10-27T10:00:00+00:00
+                    remote_dt = datetime.fromisoformat(remote_date_iso)
+
+                    # Parse user's shallow_since setting
+                    user_cutoff_dt = _parse_shallow_since_to_date(shallow_since)
+
+                    if user_cutoff_dt and remote_dt < user_cutoff_dt:
+                        # Remote is older than our shallow window.
+                        # Set shallow-since to 1 day before the remote's latest commit
+                        # to ensure we catch that commit.
+                        adjusted_dt = remote_dt - timedelta(days=1)
+                        effective_shallow_since = adjusted_dt.strftime("%Y-%m-%d")
+                        console.print(
+                            f"  [yellow]Adjusting shallow-since to {effective_shallow_since} (remote tip is older)[/yellow]"
+                        )
+                    else:
+                        console.print(
+                            f"  [dim]Remote tip is within shallow window.[/dim]"
+                        )
+                except Exception as e:
+                    console.print(
+                        f"  [yellow]Warning: Could not adjust shallow-since: {e}. Using original.[/yellow]"
+                    )
+            else:
+                console.print(
+                    f"  [yellow]Warning: Could not fetch remote tip info. Using original shallow-since.[/yellow]"
+                )
+
         backup_path = _create_backup(repo_path)
         if backup_path is None:
             return "error", "Failed to create backup, aborting reclone", None
@@ -343,13 +443,14 @@ def _reclone_repo(
         console.print(f"  [cyan]Removing old repository...[/cyan]")
         shutil.rmtree(repo_path)
 
-        # Clone fresh
         clone_cmd = ["git", "clone"]
-        if shallow_since:
-            clone_cmd.extend(["--shallow-since", shallow_since])
+        if effective_shallow_since:
+            clone_cmd.extend(["--shallow-since", effective_shallow_since])
         clone_cmd.extend([remote_url, str(repo_path)])
 
-        console.print(f"  [cyan]Cloning with shallow-since='{shallow_since}'...[/cyan]")
+        console.print(
+            f"  [cyan]Cloning with shallow-since='{effective_shallow_since}'...[/cyan]"
+        )
         result = subprocess.run(
             clone_cmd,
             capture_output=True,
@@ -358,7 +459,6 @@ def _reclone_repo(
             check=True,
         )
 
-        # Checkout specific branch if needed
         if current_branch and current_branch not in ("master", "main"):
             try:
                 subprocess.run(
@@ -373,14 +473,10 @@ def _reclone_repo(
                     f"  [yellow]Warning: Could not checkout branch '{current_branch}'[/yellow]"
                 )
 
-        # Check shallow boundary
         shallow_status = _check_shallow_boundary(
-            repo_path, current_branch or "HEAD", shallow_since
+            repo_path, current_branch or "HEAD", effective_shallow_since
         )
-
-        # Success! Clean up backup
         _cleanup_backup(backup_path)
-
         return (
             "success",
             f"Recloned successfully (branch: {current_branch or 'default'})",
@@ -388,7 +484,6 @@ def _reclone_repo(
         )
 
     except subprocess.TimeoutExpired:
-        # Restore from backup on timeout
         if backup_path:
             _restore_from_backup(backup_path, repo_path)
             _cleanup_backup(backup_path)
@@ -396,32 +491,26 @@ def _reclone_repo(
 
     except subprocess.CalledProcessError as e:
         stderr = _safe_strip(e.stderr)
-
-        # Restore from backup on clone failure
         if backup_path:
             console.print(f"  [yellow]Clone failed, restoring from backup...[/yellow]")
             _restore_from_backup(backup_path, repo_path)
             _cleanup_backup(backup_path)
 
-        # Special handling for HEAD ambiguity errors
         if "ambiguous argument 'HEAD'" in stderr or "unknown revision" in stderr:
             return (
                 "failed",
                 f"Repository was corrupted/empty (HEAD error). Backed up and restored. Original error: {stderr[:200]}",
                 None,
             )
-
         return "failed", f"Clone failed: {stderr[:300]}", None
 
     except Exception as e:
-        # Restore from backup on any other exception
         if backup_path:
             console.print(
                 f"  [yellow]Exception occurred, restoring from backup...[/yellow]"
             )
             _restore_from_backup(backup_path, repo_path)
             _cleanup_backup(backup_path)
-
         return "error", f"Reclone exception: {e}", None
 
 
@@ -439,6 +528,7 @@ def run_git_pull(
             if not is_safe:
                 return "error", f"Unsafe to reclone: {safety_reason}", None
             console.print(f"  [green]✓ Safe to reclone[/green]")
+
         branch = None
         try:
             result = subprocess.run(
@@ -453,6 +543,7 @@ def run_git_pull(
                 branch = None
         except Exception:
             pass
+
         if not branch:
             try:
                 result = subprocess.run(
@@ -472,10 +563,12 @@ def run_git_pull(
                 branch = result.stdout.strip().replace("origin/", "")
             except Exception:
                 branch = "HEAD"
+
         console.print(f"  [dim]Checking for updates on branch '{branch}'...[/dim]")
         has_updates, update_message = _check_if_updates_available(
             repo_path, branch, fetch_timeout
         )
+
         if not has_updates:
             console.print(f"  [blue]→ {update_message}[/blue]")
             shallow_status = _check_shallow_boundary(repo_path, branch, shallow_since)
@@ -528,6 +621,7 @@ def _build_state(
             final_stats[status] = final_stats.get(status, 0) + prev_summary.get(
                 status, {}
             ).get("count", 0)
+
     total_for_summary = sum(final_stats.values()) or total
     summary: dict[str, dict[str, float]] = {}
     for status, count in final_stats.items():
@@ -540,9 +634,11 @@ def _build_state(
             "count": count,
             "percentage": percentage,
         }
+
     current_run_paths: set[str] = set()
     for paths_list in grouped_results.values():
         current_run_paths.update(paths_list)
+
     final_grouped: dict[str, list[str]] = {
         "success": [],
         "up-to-date": [],
@@ -557,8 +653,10 @@ def _build_state(
                 for path in prev_grouped.get(k, [])
                 if path not in current_run_paths
             ]
+
     for k in grouped_results:
         final_grouped[k].extend(grouped_results[k])
+
     final_failed = []
     if previous_state:
         final_failed = [
@@ -573,7 +671,9 @@ def _build_state(
                 f"[dim]State merge: cleaned {removed_count} resolved/reprocessed "
                 f"entries from failed list, keeping {kept_count} unresolved[/dim]"
             )
+
     final_failed.extend(failed_entries)
+
     return {
         "metadata": {
             "target_directory": target_dir,
@@ -621,12 +721,14 @@ def git_pull_all_repos(
     """
     base_path = Path(target_dir).expanduser().resolve()
     target_dir_str = str(base_path)
+
     if state_path is not None:
         state_path = state_path.expanduser().resolve()
     elif out_path is not None:
         state_path = out_path.expanduser().resolve()
     else:
         state_path = base_path / "_git_pull_all_repos_state.json"
+
     mode_line = (
         f'[bold yellow]Shallow mode enabled: --shallow-since="{shallow_since}"[/bold yellow]'
         if shallow_since
@@ -643,12 +745,14 @@ def git_pull_all_repos(
         else "[dim]Safety Check: disabled (faster)[/dim]"
     )
     backup_line = "[bold cyan]Backup Protection: ENABLED[/bold cyan]"
+
     if continue_from_last:
         console.print(
             "[bold cyan]Mode: Continue from last unprocessed repo[/bold cyan]"
         )
     elif only_failed:
         console.print("[bold cyan]Mode: Only retry failed repos[/bold cyan]")
+
     console.print(
         f"[bold cyan]Scanning for git repositories in:[/bold cyan] {base_path}\n"
         f"{mode_line}\n"
@@ -657,6 +761,7 @@ def git_pull_all_repos(
         f"{backup_line}\n"
     )
     console.print(f"[dim]State file: {state_path}[/dim]\n")
+
     processed_repos: set[str] = set()
     previous_state = None
     if continue_from_last or only_failed:
@@ -681,6 +786,7 @@ def git_pull_all_repos(
             console.print("[yellow]No previous state found. Starting fresh.[/yellow]\n")
             continue_from_last = False
             only_failed = False
+
     repos: list[RepoInfo] = list(
         find_git_repositories(
             base_path,
@@ -689,6 +795,7 @@ def git_pull_all_repos(
             check_remote_tracking=True,
         )
     )
+
     if only_failed and previous_state:
         failed_paths = {entry["repoPath"] for entry in previous_state.get("failed", [])}
         repos = [repo for repo in repos if str(repo.path) in failed_paths]
@@ -700,17 +807,20 @@ def git_pull_all_repos(
         if not repos:
             console.print("[green]All repos already processed! Nothing to do.[/green]")
             return
+
     if sort_by_size:
         console.print("[bold]Pull order (sorted by size):[/bold]")
         for i, repo_info in enumerate(repos, 1):
             console.print(f" {i:3d}. {repo_info.name:40s} → {repo_info.size_display}")
         console.print()
+
     total_this_run = len(repos)
     grand_total = (
         previous_state.get("metadata", {}).get("total_repositories", total_this_run)
         if previous_state
         else total_this_run
     )
+
     progress_data: dict[str, dict[str, str]] = (
         previous_state.get("progress", {}) if previous_state else {}
     )
@@ -721,6 +831,7 @@ def git_pull_all_repos(
         "error": [],
     }
     failed_entries: list[dict[str, str]] = []
+
     if total_this_run == 0:
         console.print("[yellow]No git repositories found.[/yellow]")
         state = _build_state(
@@ -739,10 +850,12 @@ def git_pull_all_repos(
         _write_state_file(state_path, state)
         console.print(f"[dim]State saved to: {state_path}[/dim]")
         return
+
     console.print(
         f"[bold]Found [magenta]{total_this_run}[/magenta] repositories to process this run. "
         f"(Grand total: {grand_total})[/bold]\n"
     )
+
     stats = {"success": 0, "up-to-date": 0, "failed": 0, "error": 0}
 
     def save_state(completed: bool = False) -> None:
@@ -771,17 +884,21 @@ def git_pull_all_repos(
         transient=True,
     ) as progress:
         task = progress.add_task("[cyan]Pulling repositories...", total=total_this_run)
+
         for repo_info in repos:
             repo = repo_info.path
             short_name = repo_info.name
             repo_key = str(repo)
+
             progress.update(task, description=f"[cyan]Pulling {short_name}...")
+
             status, message, shallow_status = run_git_pull(
                 repo,
                 shallow_since=shallow_since,
                 use_reclone=use_reclone,
                 check_safety=check_safety,
             )
+
             stats[status] += 1
             progress_data[repo_key] = {
                 "status": status,
@@ -790,25 +907,32 @@ def git_pull_all_repos(
             }
             grouped_results[status].append(repo_key)
             processed_repos.add(repo_key)
+
             if status in ("failed", "error"):
                 failed_entries.append({"repoPath": repo_key, "message": message})
+
             save_state()
+
             icon = {
                 "success": "[green]✓[/green]",
                 "up-to-date": "[blue]→[/blue]",
                 "failed": "[red]✗[/red]",
                 "error": "[red bold]![/red bold]",
             }[status]
+
             shallow_note = ""
             if shallow_status and shallow_status.get("remote_has_unfetched") is True:
                 shallow_note = " [yellow]⚠ Remote has commits outside shallow-since window[/yellow]"
+
             console.print(
                 f" {icon} {repo} → "
                 f"[dim]{message[:120]}{'...' if len(message) > 120 else ''}[/dim]"
                 f"{shallow_note}"
             )
             progress.advance(task)
+
     save_state(completed=True)
+
     merged_stats = dict(stats)
     if previous_state:
         prev_summary = previous_state.get("summary", {})
@@ -816,12 +940,14 @@ def git_pull_all_repos(
             merged_stats[status] = merged_stats.get(status, 0) + prev_summary.get(
                 status, {}
             ).get("count", 0)
+
     unfetched_repos = [
         repo_key
         for repo_key, data in progress_data.items()
         if data.get("shallow_status", {})
         and data["shallow_status"].get("remote_has_unfetched") is True
     ]
+
     if unfetched_repos:
         console.print(
             f"\n[yellow]⚠ {len(unfetched_repos)} repo(s) have commits outside "
@@ -833,6 +959,7 @@ def git_pull_all_repos(
                 f"   • {repo_key}  local={ss.get('local_tip_date')}  "
                 f"remote={ss.get('remote_tip_date')}"
             )
+
     if total_this_run > 0:
         table = Table(
             title="Pull Summary (This Run)",
@@ -842,12 +969,14 @@ def git_pull_all_repos(
         table.add_column("Status", style="bold")
         table.add_column("Count", justify="right")
         table.add_column("Percentage", justify="right")
+
         status_order = ["success", "up-to-date", "failed", "error"]
         for status in status_order:
             count = stats.get(status, 0)
             perc = (count / total_this_run * 100) if total_this_run > 0 else 0
             label = _status_label(status)
             table.add_row(label, str(count), f"{perc:5.1f}%")
+
         console.print("\n")
         console.print(table)
         console.print(
@@ -932,18 +1061,23 @@ def main():
         help="Enable safety checks before recloning (checks for uncommitted/staged changes). "
         "Disabled by default for performance.",
     )
+
     args = parser.parse_args()
     target_dir = Path(args.target_dir).expanduser().resolve()
+
     if args.out is not None:
         out_path = args.out.expanduser().resolve()
         if out_path.is_dir() or args.out.suffix == "":
             out_path = out_path / "_git_pull_all_repos_state.json"
     else:
         out_path = target_dir / "_git_pull_all_repos_state.json"
+
     shallow_since_value: str | None = args.shallow_since
     if shallow_since_value and shallow_since_value.lower() in ("full", "none", ""):
         shallow_since_value = None
+
     use_reclone = not args.no_reclone
+
     console.print(
         f"[bold]Target directory:[/bold] [link=file://{target_dir}]{target_dir}[/link]"
     )
@@ -965,6 +1099,7 @@ def main():
         + ("[magenta]Enabled[/magenta]" if args.check_safety else "[dim]Disabled[/dim]")
     )
     console.print("[bold]Backup Protection:[/bold] [cyan]Enabled[/cyan]")
+
     git_pull_all_repos(
         args.target_dir,
         out_path=out_path,
